@@ -1,8 +1,5 @@
-# trading_bot_lib_final_fixed.py (HOÀN CHỈNH - SỬA LỖI ĐÓNG LỆNH + NHẬN VỊ THẾ CÓ SẴN)
-# =============================================================================
-#  FIXED: Đóng lệnh chỉ một lần, kiểm tra thực tế từ Binance trước và sau khi đóng.
-#  FIXED: Khi phát hiện có vị thế từ trước, bot nhận coin đó, cập nhật và theo dõi.
-#  FIXED: stop_symbol chỉ xóa coin nếu không còn vị thế hoặc đã đóng thành công.
+# trading_bot_lib.py
+# Hoàn chỉnh, sửa lỗi đóng lệnh và nhận vị thế có sẵn
 # =============================================================================
 
 import json
@@ -34,10 +31,9 @@ _BINANCE_LAST_REQUEST_TIME = 0
 _BINANCE_RATE_LOCK = threading.RLock()
 _BINANCE_MIN_INTERVAL = 0.1
 
-# Blacklist mở rộng cho cả USDT và USDC
 _SYMBOL_BLACKLIST = {'BTCUSDT', 'ETHUSDT', 'BTCUSDC', 'ETHUSDC'}
 
-# ========== CACHE COIN TẬP TRUNG – THREAD-SAFE ==========
+# ========== CACHE COIN TẬP TRUNG ==========
 class CoinCache:
     def __init__(self):
         self._data: List[Dict] = []
@@ -81,7 +77,7 @@ class CoinCache:
 
 _COINS_CACHE = CoinCache()
 
-# ========== CẤU HÌNH CÂN BẰNG LỆNH – THREAD-SAFE ==========
+# ========== CẤU HÌNH CÂN BẰNG LỆNH ==========
 class BalanceConfig:
     def __init__(self):
         self._config = {
@@ -342,7 +338,7 @@ def create_price_threshold_keyboard():
         "resize_keyboard": True, "one_time_keyboard": True
     }
 
-# ========== HÀM API BINANCE CẢI TIẾN ==========
+# ========== HÀM API BINANCE ==========
 def _wait_for_rate_limit():
     global _BINANCE_LAST_REQUEST_TIME
     with _BINANCE_RATE_LOCK:
@@ -428,7 +424,7 @@ def binance_api_request(url, method='GET', params=None, headers=None):
     logger.error(f"❌ Thất bại yêu cầu API sau {max_retries} lần thử: {base_url}")
     return None
 
-# ========== HÀM CACHE COIN – CHỈ BOTMANAGER GHI, BOT CHỈ ĐỌC ==========
+# ========== CACHE COIN ==========
 def refresh_coins_cache():
     try:
         url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -577,7 +573,7 @@ def force_refresh_coin_cache():
         return True
     return False
 
-# ========== HÀM LỌC COIN ==========
+# ========== LỌC COIN ==========
 def filter_coins_for_side(side, excluded_coins=None):
     all_coins = get_coins_with_info()
     filtered = []
@@ -789,7 +785,7 @@ def get_current_price(symbol):
         logger.error(f"Lỗi giá {symbol}: {str(e)}")
         return 0
 
-# ========== CACHE VỊ THẾ TẬP TRUNG ==========
+# ========== CACHE VỊ THẾ ==========
 class PositionCache:
     def __init__(self):
         self._positions = []
@@ -877,7 +873,7 @@ def get_positions(symbol=None, api_key=None, api_secret=None):
         logger.error(f"Lỗi vị thế: {str(e)}")
         return []
 
-# ========== LỚP QUẢN LÝ CỐT LÕI ==========
+# ========== LỚP QUẢN LÝ ==========
 class CoinManager:
     def __init__(self):
         self.active_coins = set()
@@ -1197,7 +1193,7 @@ class WebSocketManager:
             self.remove_symbol(symbol)
         self.executor.shutdown(wait=False)
 
-# ========== LỚP BOT CỐT LÕI (ĐÃ SỬA CÁC HÀM QUAN TRỌNG) ==========
+# ========== LỚP BOT CỐT LÕI ==========
 class BaseBot:
     def __init__(self, symbol, lev, percent, tp, sl, roi_trigger, ws_manager, api_key, api_secret,
                  telegram_bot_token, telegram_chat_id, strategy_name, config_key=None, bot_id=None,
@@ -1534,31 +1530,27 @@ class BaseBot:
             })
             self.symbol_data[symbol]['last_close_time'] = time.time()
 
-    # ---------- Mở lệnh (ĐÃ SỬA: nhận vị thế có sẵn) ----------
+    # ---------- Mở lệnh ----------
     def _open_symbol_position(self, symbol, side):
         with self.symbol_locks[symbol]:
             try:
-                # FIXED: Kiểm tra chắc chắn vị thế thực tế trước khi mở
+                # Kiểm tra vị thế thực tế trước khi mở
                 real_pos = self._force_check_position(symbol)
                 if real_pos:
                     entry_price = float(real_pos.get('entryPrice', 0))
                     position_amt = float(real_pos.get('positionAmt', 0))
                     if entry_price > 0 and abs(position_amt) > 0:
                         self.log(f"ℹ️ {symbol} - Đã có vị thế từ trước, cập nhật và theo dõi")
-                        # Cập nhật cache và dữ liệu bot
                         _POSITION_CACHE.refresh(force=True)
                         self._check_symbol_position(symbol)
-                        # Đảm bảo coin đã được thêm (nếu chưa)
                         if symbol not in self.active_symbols:
                             self._add_symbol(symbol)
-                        return False  # Không mở lệnh mới
+                        return False
 
-                # Nếu không có vị thế, tiếp tục quy trình mở lệnh
                 self._check_symbol_position(symbol)
                 if self.symbol_data[symbol]['position_open']:
                     return False
 
-                # Set leverage
                 if not set_leverage(symbol, self.lev, self.api_key, self.api_secret):
                     self.log(f"❌ {symbol} - Không thể cài đặt đòn bẩy {self.lev}x (Binance từ chối)")
                     self.stop_symbol(symbol, failed=True)
@@ -1709,7 +1701,7 @@ class BaseBot:
                 self.stop_symbol(symbol, failed=True)
                 return False
 
-    # ---------- Đóng lệnh (ĐÃ SỬA: chỉ 1 lần, kiểm tra thực tế) ----------
+    # ---------- Đóng lệnh ----------
     def _close_symbol_position(self, symbol, reason=""):
         with self.symbol_locks[symbol]:
             try:
@@ -1725,7 +1717,6 @@ class BaseBot:
                     if qty == 0:
                         self.log(f"⚠️ {symbol} - Vị thế thực tế đã đóng, bỏ qua.")
                         self._reset_symbol_position(symbol)
-                        # Gọi stop_symbol để dọn dẹp hoàn toàn
                         self.stop_symbol(symbol)
                         return True
                 else:
@@ -1740,25 +1731,21 @@ class BaseBot:
                 cancel_all_orders(symbol, self.api_key, self.api_secret)
                 time.sleep(1)
 
-                # Gửi lệnh đóng
                 result = place_order(symbol, close_side, qty, self.api_key, self.api_secret)
                 if result and 'orderId' in result:
                     self.log(f"🔴 Đã gửi lệnh đóng {symbol} {reason}")
-                    time.sleep(3)  # chờ lệnh khớp
+                    time.sleep(3)
 
-                    # Kiểm tra lại vị thế sau khi đóng
                     final_pos = self._force_check_position(symbol)
                     if final_pos is None or abs(float(final_pos.get('positionAmt', 0))) == 0:
                         self.log(f"✅ Đã đóng thành công {symbol}")
                         _POSITION_CACHE.refresh(force=True)
-                        self.stop_symbol(symbol)  # xóa coin khỏi danh sách
+                        self.stop_symbol(symbol)
                         return True
                     else:
-                        # Vị thế vẫn còn (có thể khớp một phần) → không reset, để bot thử lại ở lần kiểm tra sau
-                        self.log(f"⚠️ {symbol} - Vị thế vẫn còn sau lệnh đóng, có thể khớp một phần. Sẽ thử lại sau.")
-                        # Cập nhật lại qty trong cache
                         remaining_qty = abs(float(final_pos.get('positionAmt', 0)))
                         self.symbol_data[symbol]['qty'] = remaining_qty if side == "BUY" else -remaining_qty
+                        self.log(f"⚠️ {symbol} - Vị thế vẫn còn {remaining_qty} sau lệnh đóng, sẽ thử lại sau.")
                         return False
                 else:
                     self.log(f"❌ Lệnh đóng {symbol} thất bại: {result.get('msg', 'Unknown') if result else 'No response'}")
@@ -1768,25 +1755,22 @@ class BaseBot:
                 self.log(f"❌ Lỗi đóng vị thế {symbol}: {str(e)}")
                 return False
 
-    # ---------- Dừng coin (chỉ xóa nếu đóng thành công) ----------
+    # ---------- Dừng coin ----------
     def stop_symbol(self, symbol, failed=False):
         if symbol not in self.active_symbols:
             return False
         self.log(f"⛔ Đang dừng coin {symbol}...{' (lỗi)' if failed else ''}")
 
-        # Nếu đang có vị thế, cố gắng đóng
         if self.symbol_data[symbol]['position_open']:
             closed = self._close_symbol_position(symbol, reason="(Stop by user)")
             if not closed:
                 self.log(f"❌ Không thể đóng vị thế {symbol}, giữ lại coin để thử sau")
                 return False
 
-        # Nếu không có vị thế hoặc đã đóng thành công
         self.ws_manager.remove_symbol(symbol)
         self.active_symbols.remove(symbol)
         self.coin_manager.unregister_coin(symbol)
 
-        # Nếu thất bại (không mở được lệnh) → release coin và blacklist tạm
         if failed and self._bot_manager:
             self._bot_manager.bot_coordinator.release_coin(symbol)
             self._bot_manager.bot_coordinator.add_temp_blacklist(symbol, duration=300)
@@ -2964,5 +2948,4 @@ class BotManager:
                         bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
             self.user_states[chat_id] = {}
 
-# Bỏ qua SSL context
 ssl._create_default_https_context = ssl._create_unverified_context
