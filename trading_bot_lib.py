@@ -1067,7 +1067,6 @@ class BaseBot:
                             if queue_pos > 0:
                                 queue_info = self.bot_coordinator.get_queue_info()
                                 if current_time - last_coin_search_log > log_interval:
-                                    self.log(f"⏳ Đang chờ tìm coin (vị trí: {queue_pos}/{queue_info['queue_size'] + 1})")
                                     last_coin_search_log = current_time
                             time.sleep(1)
                     else:
@@ -1259,13 +1258,6 @@ class BaseBot:
                 # Kiểm tra lại vị thế một lần nữa
                 self._check_symbol_position(symbol)
                 if self.symbol_data[symbol]['position_open']:
-                    return False
-
-                # Kiểm tra đòn bẩy tối đa
-                max_lev = self.symbol_data[symbol].get('max_leverage', 50)
-                if self.lev > max_lev:
-                    self.log(f"❌ {symbol} - Đòn bẩy {self.lev}x vượt quá max {max_lev}x")
-                    self.stop_symbol(symbol, failed=True)
                     return False
 
                 # Set leverage
