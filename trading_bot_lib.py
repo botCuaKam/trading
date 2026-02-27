@@ -1,6 +1,6 @@
 # trading_bot_lib.py
 # Hoàn chỉnh, không cache, API trực tiếp, chỉ 1 bot tìm coin tại 1 thời điểm
-# Đã bỏ kiểm tra đòn bẩy, bỏ log chờ coin, sửa executedQty < 0
+# Đã sửa lỗi signature, reset last_scan_time khi mất coin, bỏ log chờ coin
 # =============================================================================
 
 import json
@@ -323,25 +323,39 @@ def binance_request(method, endpoint, params=None, api_key=None, api_secret=None
     if api_key:
         headers['X-MBX-APIKEY'] = api_key
 
-    if signed:
-        if not api_secret:
-            raise ValueError("API secret required for signed requests")
-        params = params or {}
-        params['timestamp'] = int(time.time() * 1000)
-        # Sắp xếp params theo key để chữ ký chính xác (theo yêu cầu Binance)
-        sorted_params = dict(sorted(params.items()))
-        query = urllib.parse.urlencode(sorted_params)
-        signature = sign(query, api_secret)
-        params['signature'] = signature
-
     max_retries = 3
     for attempt in range(max_retries):
         try:
             _wait_for_rate_limit()
-            if method.upper() in ('GET', 'DELETE'):
-                response = requests.request(method, url, params=params, headers=headers, timeout=15)
+
+            if signed:
+                if not api_secret:
+                    raise ValueError("API secret required for signed requests")
+                # Tạo bản sao params và thêm timestamp
+                params = params or {}
+                params['timestamp'] = int(time.time() * 1000)
+                # Sắp xếp params theo key
+                sorted_params = dict(sorted(params.items()))
+                query = urllib.parse.urlencode(sorted_params)
+                signature = sign(query, api_secret)
+                # Tạo query string hoàn chỉnh (bao gồm signature)
+                final_query = query + "&signature=" + signature
             else:
-                response = requests.request(method, url, data=params, headers=headers, timeout=15)
+                final_query = urllib.parse.urlencode(params) if params else ""
+
+            # Gửi request
+            if method.upper() == 'GET':
+                if final_query:
+                    response = requests.get(url + "?" + final_query, headers=headers, timeout=15)
+                else:
+                    response = requests.get(url, headers=headers, timeout=15)
+            elif method.upper() == 'DELETE':
+                if final_query:
+                    response = requests.delete(url + "?" + final_query, headers=headers, timeout=15)
+                else:
+                    response = requests.delete(url, headers=headers, timeout=15)
+            else:  # POST
+                response = requests.post(url, data=final_query, headers=headers, timeout=15)
 
             if response.status_code == 200:
                 return response.json()
@@ -741,6 +755,7 @@ class SmartCoinFinder:
         try:
             now = time.time()
             if now - self.last_scan_time < self.scan_cooldown:
+                # Không log để tránh spam
                 return None
             self.last_scan_time = now
 
@@ -1318,7 +1333,7 @@ class BaseBot:
                     executed_qty = float(result.get('executedQty', 0))
                     avg_price = float(result.get('avgPrice', current_price))
 
-                    # Sửa thành < 0 thay vì <= 0
+                    # Sửa thành < 0 thay vì <= 0 (theo yêu cầu giữ nguyên cơ chế cũ)
                     if executed_qty < 0:
                         self.log(f"❌ {symbol} - Lệnh không khớp")
                         self.stop_symbol(symbol, failed=True)
@@ -1460,6 +1475,8 @@ class BaseBot:
             self.bot_coordinator.bot_lost_coin(self.bot_id)
             self.bot_coordinator.finish_coin_search(self.bot_id)
             self.status = "searching"
+            # Reset last_scan_time để có thể tìm coin mới ngay lập tức
+            self.coin_finder.last_scan_time = 0
 
         self.log(f"✅ Đã dừng coin {symbol}")
         return True
@@ -2474,7 +2491,6 @@ class BotManager:
 
         else:
             self.send_main_menu(chat_id)
-
 
     def _finish_bot_creation(self, chat_id, user_state):
         try:
