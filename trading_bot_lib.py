@@ -1067,7 +1067,6 @@ class BaseBot:
                             if queue_pos > 0:
                                 queue_info = self.bot_coordinator.get_queue_info()
                                 if current_time - last_coin_search_log > log_interval:
-                                    self.log(f"⏳ Đang chờ tìm coin (vị trí: {queue_pos}/{queue_info['queue_size'] + 1})")
                                     last_coin_search_log = current_time
                             time.sleep(1)  # giảm sleep
                     else:
