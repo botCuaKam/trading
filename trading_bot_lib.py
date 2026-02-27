@@ -1,7 +1,6 @@
 # trading_bot_lib.py
 # Hoàn chỉnh, không cache, API trực tiếp, chỉ 1 bot tìm coin tại 1 thời điểm
-# Đã sửa lỗi timestamp cho method DELETE, thêm sắp xếp params khi ký
-# Sửa lỗi lấy max leverage bằng API leverageBracket
+# Đã bỏ kiểm tra đòn bẩy, bỏ log chờ coin, sửa executedQty < 0
 # =============================================================================
 
 import json
@@ -443,26 +442,6 @@ def set_leverage(symbol, lev, api_key, api_secret):
         logger.error(f"Lỗi set leverage {symbol}: {str(e)}")
         return False
 
-def get_max_leverage(symbol, api_key, api_secret):
-    """
-    Lấy max leverage thực tế của symbol từ API leverageBracket
-    Trả về số nguyên (max leverage) hoặc None nếu lỗi
-    """
-    try:
-        data = binance_request('GET', '/fapi/v1/leverageBracket',
-                               params={"symbol": symbol.upper()},
-                               api_key=api_key, api_secret=api_secret, signed=True)
-        if not data or not isinstance(data, list) or len(data) == 0:
-            return None
-        brackets = data[0].get("brackets", [])
-        if not brackets:
-            return None
-        # bracket đầu tiên là leverage cao nhất
-        return int(brackets[0].get("initialLeverage", 20))
-    except Exception as e:
-        logger.error(f"Lỗi lấy max leverage {symbol}: {str(e)}")
-        return None
-
 def get_balance(api_key, api_secret):
     try:
         data = binance_request('GET', '/fapi/v2/account', api_key=api_key, api_secret=api_secret, signed=True)
@@ -830,15 +809,8 @@ class SmartCoinFinder:
                 if target_side == "SELL" and price <= sell_threshold:
                     continue
 
-                # Kiểm tra đòn bẩy tối thiểu bằng API leverageBracket
-                max_leverage = get_max_leverage(symbol, self.api_key, self.api_secret)
-                if not max_leverage:
-                    # Nếu không lấy được, bỏ qua (có thể do lỗi tạm thời, nhưng an toàn là loại)
-                    continue
-                if max_leverage < _BALANCE_CONFIG.get('min_leverage', 10):
-                    continue
-
-                logger.info(f"✅ Tìm thấy coin {symbol} phù hợp ({target_side}) | giá: {price:.4f} | volume: {volume:.2f} | max_lev: {max_leverage}")
+                # KHÔNG kiểm tra đòn bẩy ở đây nữa
+                logger.info(f"✅ Tìm thấy coin {symbol} phù hợp ({target_side}) | giá: {price:.4f} | volume: {volume:.2f}")
                 return symbol
 
             logger.warning(f"⚠️ Không tìm thấy coin phù hợp cho hướng {target_side}")
@@ -1061,8 +1033,8 @@ class BaseBot:
                         search_permission = self.bot_coordinator.request_coin_search(self.bot_id)
                         if search_permission:
                             if current_time - last_coin_search_log > log_interval:
-                                queue_info = self.bot_coordinator.get_queue_info()
-                                self.log(f"🔍 Đang tìm coin (vị trí: 1/{queue_info['queue_size'] + 1})...")
+                                # Chỉ log khi bắt đầu tìm
+                                self.log(f"🔍 Đang tìm coin...")
                                 last_coin_search_log = current_time
 
                             found_coin = None
@@ -1083,12 +1055,7 @@ class BaseBot:
                                     self.log(f"❌ Không tìm thấy coin phù hợp")
                                     last_no_coin_found_log = current_time
                         else:
-                            queue_pos = self.bot_coordinator.get_queue_position(self.bot_id)
-                            if queue_pos > 0:
-                                queue_info = self.bot_coordinator.get_queue_info()
-                                if current_time - last_coin_search_log > log_interval:
-                                    self.log(f"⏳ Đang chờ tìm coin (vị trí: {queue_pos}/{queue_info['queue_size'] + 1})")
-                                    last_coin_search_log = current_time
+                            # Không log chờ nữa
                             time.sleep(1)
                     else:
                         # Bot tĩnh không tìm coin mới
@@ -1276,14 +1243,7 @@ class BaseBot:
                 if self.symbol_data[symbol]['position_open']:
                     return False
 
-                # Kiểm tra đòn bẩy tối đa thực tế bằng API leverageBracket
-                max_lev = get_max_leverage(symbol, self.api_key, self.api_secret)
-                if max_lev and self.lev > max_lev:
-                    self.log(f"❌ {symbol} - Đòn bẩy {self.lev}x vượt quá max {max_lev}x")
-                    self.stop_symbol(symbol, failed=True)
-                    return False
-
-                # Set leverage
+                # KHÔNG kiểm tra max leverage ở đây nữa, cứ gọi set_leverage
                 if not set_leverage(symbol, self.lev, self.api_key, self.api_secret):
                     self.log(f"❌ {symbol} - Không thể cài đặt đòn bẩy {self.lev}x")
                     self.stop_symbol(symbol, failed=True)
@@ -1358,7 +1318,8 @@ class BaseBot:
                     executed_qty = float(result.get('executedQty', 0))
                     avg_price = float(result.get('avgPrice', current_price))
 
-                    if executed_qty <= 0:
+                    # Sửa thành < 0 thay vì <= 0
+                    if executed_qty < 0:
                         self.log(f"❌ {symbol} - Lệnh không khớp")
                         self.stop_symbol(symbol, failed=True)
                         return False
@@ -1634,7 +1595,8 @@ class BaseBot:
                 executed_qty = float(result.get('executedQty', 0))
                 avg_price = float(result.get('avgPrice', current_price))
 
-                if executed_qty <= 0:
+                # Sửa thành < 0 thay vì <= 0
+                if executed_qty < 0:
                     self.log(f"⚠️ Lệnh nhồi {symbol} không khớp")
                     return
 
@@ -1914,7 +1876,6 @@ class BotManager:
             "📊 <b>LỰA CHỌN COIN:</b>\n"
             "• MUA: chọn coin có giá < ngưỡng mua (có thể cấu hình)\n"
             "• BÁN: chọn coin có giá > ngưỡng bán (có thể cấu hình)\n"
-            "• Yêu cầu đòn bẩy tối thiểu: 10x (kiểm tra thực tế)\n"
             "• Loại trừ coin đã có vị thế / đang theo dõi\n"
             "• Loại trừ BTCUSDT, ETHUSDT, BTCUSDC, ETHUSDC\n\n"
             "🔄 <b>NHỒI LỆNH (PYRAMIDING):</b>\n"
@@ -1985,8 +1946,7 @@ class BotManager:
             if enable_balance_orders:
                 balance_info = (f"\n⚖️ <b>CÂN BẰNG LỆNH: BẬT</b>\n"
                                 f"• Mua: giá < {buy_price_threshold} USDT/USDC\n"
-                                f"• Bán: giá > {sell_price_threshold} USDT/USDC\n"
-                                f"• Đòn bẩy tối thiểu: {_BALANCE_CONFIG.get('min_leverage', 10)}x\n")
+                                f"• Bán: giá > {sell_price_threshold} USDT/USDC\n")
 
             success_msg = (f"✅ <b>ĐÃ TẠO {created_count} BOT CÂN BẰNG</b>\n\n"
                            f"🎯 Chiến lược: {strategy_type}\n💰 Đòn bẩy: {lev}x\n"
