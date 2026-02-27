@@ -1,6 +1,7 @@
 # trading_bot_lib.py
 # Hoàn chỉnh, không cache, API trực tiếp, chỉ 1 bot tìm coin tại 1 thời điểm
 # Đã sửa lỗi timestamp cho method DELETE, thêm sắp xếp params khi ký
+# Sửa lỗi lấy max leverage bằng API leverageBracket
 # =============================================================================
 
 import json
@@ -442,6 +443,26 @@ def set_leverage(symbol, lev, api_key, api_secret):
         logger.error(f"Lỗi set leverage {symbol}: {str(e)}")
         return False
 
+def get_max_leverage(symbol, api_key, api_secret):
+    """
+    Lấy max leverage thực tế của symbol từ API leverageBracket
+    Trả về số nguyên (max leverage) hoặc None nếu lỗi
+    """
+    try:
+        data = binance_request('GET', '/fapi/v1/leverageBracket',
+                               params={"symbol": symbol.upper()},
+                               api_key=api_key, api_secret=api_secret, signed=True)
+        if not data or not isinstance(data, list) or len(data) == 0:
+            return None
+        brackets = data[0].get("brackets", [])
+        if not brackets:
+            return None
+        # bracket đầu tiên là leverage cao nhất
+        return int(brackets[0].get("initialLeverage", 20))
+    except Exception as e:
+        logger.error(f"Lỗi lấy max leverage {symbol}: {str(e)}")
+        return None
+
 def get_balance(api_key, api_secret):
     try:
         data = binance_request('GET', '/fapi/v2/account', api_key=api_key, api_secret=api_secret, signed=True)
@@ -809,16 +830,15 @@ class SmartCoinFinder:
                 if target_side == "SELL" and price <= sell_threshold:
                     continue
 
-                # Kiểm tra đòn bẩy tối đa (lấy từ exchangeInfo)
-                max_leverage = 50
-                for f in symbol_info.get('filters', []):
-                    if f['filterType'] == 'LEVERAGE' and 'maxLeverage' in f:
-                        max_leverage = int(f['maxLeverage'])
-                        break
+                # Kiểm tra đòn bẩy tối thiểu bằng API leverageBracket
+                max_leverage = get_max_leverage(symbol, self.api_key, self.api_secret)
+                if not max_leverage:
+                    # Nếu không lấy được, bỏ qua (có thể do lỗi tạm thời, nhưng an toàn là loại)
+                    continue
                 if max_leverage < _BALANCE_CONFIG.get('min_leverage', 10):
                     continue
 
-                logger.info(f"✅ Tìm thấy coin {symbol} phù hợp ({target_side}) | giá: {price:.4f} | volume: {volume:.2f}")
+                logger.info(f"✅ Tìm thấy coin {symbol} phù hợp ({target_side}) | giá: {price:.4f} | volume: {volume:.2f} | max_lev: {max_leverage}")
                 return symbol
 
             logger.warning(f"⚠️ Không tìm thấy coin phù hợp cho hướng {target_side}")
@@ -1067,6 +1087,7 @@ class BaseBot:
                             if queue_pos > 0:
                                 queue_info = self.bot_coordinator.get_queue_info()
                                 if current_time - last_coin_search_log > log_interval:
+                                    self.log(f"⏳ Đang chờ tìm coin (vị trí: {queue_pos}/{queue_info['queue_size'] + 1})")
                                     last_coin_search_log = current_time
                             time.sleep(1)
                     else:
@@ -1152,16 +1173,15 @@ class BaseBot:
             'step_size': None,
             'min_qty': None,
             'min_notional': None,
-            'max_leverage': None
         }
-        # Lấy thông tin tĩnh ngay
+        # Lấy thông tin tĩnh ngay (step_size, min_qty, min_notional)
         self._load_symbol_info(symbol)
         self.ws_manager.add_symbol(symbol, lambda p, s=symbol: self._handle_price_update(s, p))
         self.coin_manager.register_coin(symbol)
         self.log(f"➕ Đã thêm {symbol} vào theo dõi")
 
     def _load_symbol_info(self, symbol):
-        """Lấy thông tin step_size, min_qty, min_notional, max_leverage từ exchangeInfo"""
+        """Lấy thông tin step_size, min_qty, min_notional từ exchangeInfo"""
         try:
             info = get_symbol_info(symbol)
             if not info:
@@ -1169,20 +1189,16 @@ class BaseBot:
             step_size = 0.001
             min_qty = 0.001
             min_notional = 5.0
-            max_leverage = 50
             for f in info.get('filters', []):
                 if f['filterType'] == 'LOT_SIZE':
                     step_size = float(f['stepSize'])
                     min_qty = float(f.get('minQty', step_size))
                 if f['filterType'] == 'MIN_NOTIONAL':
                     min_notional = float(f.get('notional', 5.0))
-                if f['filterType'] == 'LEVERAGE' and 'maxLeverage' in f:
-                    max_leverage = int(f['maxLeverage'])
             self.symbol_data[symbol].update({
                 'step_size': step_size,
                 'min_qty': min_qty,
                 'min_notional': min_notional,
-                'max_leverage': max_leverage
             })
         except Exception as e:
             logger.error(f"Lỗi load info {symbol}: {str(e)}")
@@ -1260,6 +1276,13 @@ class BaseBot:
                 if self.symbol_data[symbol]['position_open']:
                     return False
 
+                # Kiểm tra đòn bẩy tối đa thực tế bằng API leverageBracket
+                max_lev = get_max_leverage(symbol, self.api_key, self.api_secret)
+                if max_lev and self.lev > max_lev:
+                    self.log(f"❌ {symbol} - Đòn bẩy {self.lev}x vượt quá max {max_lev}x")
+                    self.stop_symbol(symbol, failed=True)
+                    return False
+
                 # Set leverage
                 if not set_leverage(symbol, self.lev, self.api_key, self.api_secret):
                     self.log(f"❌ {symbol} - Không thể cài đặt đòn bẩy {self.lev}x")
@@ -1335,7 +1358,7 @@ class BaseBot:
                     executed_qty = float(result.get('executedQty', 0))
                     avg_price = float(result.get('avgPrice', current_price))
 
-                    if executed_qty < 0:
+                    if executed_qty <= 0:
                         self.log(f"❌ {symbol} - Lệnh không khớp")
                         self.stop_symbol(symbol, failed=True)
                         return False
@@ -1611,7 +1634,7 @@ class BaseBot:
                 executed_qty = float(result.get('executedQty', 0))
                 avg_price = float(result.get('avgPrice', current_price))
 
-                if executed_qty < 0:
+                if executed_qty <= 0:
                     self.log(f"⚠️ Lệnh nhồi {symbol} không khớp")
                     return
 
@@ -2491,6 +2514,7 @@ class BotManager:
 
         else:
             self.send_main_menu(chat_id)
+
 
     def _finish_bot_creation(self, chat_id, user_state):
         try:
