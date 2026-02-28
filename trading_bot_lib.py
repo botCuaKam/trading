@@ -1,4 +1,4 @@
-# trading_bot_lib_final_complete.py
+# trading_bot_lib_final.py (PHẦN 1)
 # =============================================================================
 #  PHIÊN BẢN HOÀN CHỈNH - CẬP NHẬT GIÁ NHANH, TELEGRAM ĐẦY ĐỦ, TỐI ƯU HIỆU SUẤT
 # =============================================================================
