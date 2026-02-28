@@ -1,4 +1,4 @@
-# trading_bot_lib_fixed.py (HOÀN CHỈNH - SỬA LỖI CACHE KHÔNG CHỐT LỜI)
+# trading_bot_lib_fixed.py (HOÀN CHỈNH - SỬA LỖI CACHE + CHỐNG RATE LIMIT)
 # =============================================================================
 #  CÁC SỬA LỖI QUAN TRỌNG:
 #  1. Trước khi mở lệnh, gọi API kiểm tra vị thế thực tế (force check).
@@ -7,6 +7,7 @@
 #  4. Khi đóng lệnh, nếu API không còn vị thế thì reset ngay.
 #  5. Tăng tần suất cache vị thế lên 3 giây.
 #  6. Thêm cooldown sau khi mở lệnh thất bại (tránh spam tìm coin).
+#  7. Tăng khoảng cách tối thiểu giữa các request lên 0.2s để tránh rate limit.
 # =============================================================================
 
 import json
@@ -36,7 +37,7 @@ from typing import Optional, List, Dict, Any, Tuple, Callable
 # ========== CẤU HÌNH & HẰNG SỐ ==========
 _BINANCE_LAST_REQUEST_TIME = 0
 _BINANCE_RATE_LOCK = threading.RLock()
-_BINANCE_MIN_INTERVAL = 0.1
+_BINANCE_MIN_INTERVAL = 0.2  # Tăng lên 0.2s để tránh rate limit
 
 # Blacklist mở rộng cho cả USDT và USDC
 _SYMBOL_BLACKLIST = {'BTCUSDT', 'ETHUSDT', 'BTCUSDC', 'ETHUSDC'}
@@ -1589,6 +1590,7 @@ class BaseBot:
                 'roi_check_activated': False
             })
             self.symbol_data[symbol]['last_close_time'] = time.time()
+
     # ---------- Mở / Đóng lệnh (ĐÃ SỬA: KIỂM TRA VỊ THẾ BẰNG API TRƯỚC KHI MỞ) ----------
     def _open_symbol_position(self, symbol, side):
         with self.symbol_locks[symbol]:
