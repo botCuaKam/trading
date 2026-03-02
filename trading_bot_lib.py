@@ -8,6 +8,9 @@
 #  5. Tăng tần suất cache vị thế lên 3 giây.
 #  6. Thêm cooldown sau khi mở lệnh thất bại (tránh spam tìm coin).
 #  7. Tăng khoảng cách tối thiểu giữa các request lên 0.2s để tránh rate limit.
+#  8. CẢI TIẾN: WebSocket fallback sau 2 giây (thay vì 5) để giá real-time hơn.
+#  9. CẢI TIẾN: Khi có vị thế, kiểm tra API mỗi 5 giây để cập nhật entry/qty.
+# 10. CẢI TIẾN: Xác nhận đóng lệnh bằng API trước khi reset trạng thái.
 # =============================================================================
 
 import json
@@ -817,7 +820,7 @@ class PositionCache:
     def __init__(self):
         self._positions = []
         self._last_update = 0
-        self._ttl = 3  # FIX: giảm xuống 3 giây để cập nhật nhanh hơn
+        self._ttl = 3  # sẽ giảm xuống 1 trong BotManager
         self._lock = threading.RLock()
         self._api_key = None
         self._api_secret = None
@@ -1418,11 +1421,18 @@ class BaseBot:
             symbol_info = self.symbol_data[symbol]
             current_time = time.time()
 
+            # Kiểm tra vị thế định kỳ (cache)
             if current_time - symbol_info.get('last_position_check', 0) > 30:
                 self._check_symbol_position(symbol)
                 symbol_info['last_position_check'] = current_time
 
+            # Nếu đang có vị thế, kiểm tra thường xuyên hơn bằng API trực tiếp (cập nhật entry/qty)
             if symbol_info['position_open']:
+                # CẢI TIẾN: Gọi API trực tiếp mỗi 5 giây để cập nhật entry và qty
+                if current_time - symbol_info.get('last_api_check', 0) > 5:
+                    self._update_position_from_api(symbol)
+                    symbol_info['last_api_check'] = current_time
+
                 if self._check_smart_exit_condition(symbol):
                     return False
                 self._check_symbol_tp_sl(symbol)
@@ -1468,7 +1478,9 @@ class BaseBot:
             'last_pyramiding_time': 0,
             'pyramiding_base_roi': 0.0,
             'high_water_mark_roi': 0,
-            'roi_check_activated': False
+            'roi_check_activated': False,
+            # CẢI TIẾN: thêm biến để theo dõi lần cuối gọi API cập nhật entry
+            'last_api_check': 0,
         }
         self.ws_manager.add_symbol(symbol, lambda p, s=symbol: self._handle_price_update(s, p))
         self.coin_manager.register_coin(symbol)
@@ -1486,9 +1498,9 @@ class BaseBot:
         return get_current_price(symbol)
 
     def _get_fresh_price(self, symbol):
-        """Lấy giá mới nhất, ưu tiên từ WebSocket nếu cập nhật trong vòng 5 giây, nếu không thì gọi API."""
+        """Lấy giá mới nhất, ưu tiên từ WebSocket nếu cập nhật trong vòng 2 giây, nếu không thì gọi API."""
         data = self.symbol_data.get(symbol)
-        if data and time.time() - data.get('last_price_time', 0) < 5:
+        if data and time.time() - data.get('last_price_time', 0) < 2:   # CẢI TIẾN: giảm từ 5 xuống 2
             return data['last_price']
         # Gọi API
         price = get_current_price(symbol)
@@ -1511,6 +1523,24 @@ class BaseBot:
         except Exception as e:
             logger.error(f"Lỗi force check position {symbol}: {str(e)}")
             return None
+
+    def _update_position_from_api(self, symbol):
+        """Cập nhật entry và qty từ API trực tiếp (gọi khi đang có vị thế)."""
+        try:
+            real_pos = self._force_check_position(symbol)
+            if real_pos:
+                entry = float(real_pos.get('entryPrice', 0))
+                qty = float(real_pos.get('positionAmt', 0))
+                if entry > 0 and abs(qty) > 0:
+                    self.symbol_data[symbol]['entry'] = entry
+                    self.symbol_data[symbol]['qty'] = qty
+                    # Không thay đổi entry_base (giá gốc ban đầu) vì dùng cho pyramiding
+                    self.log(f"🔄 Cập nhật vị thế {symbol}: entry={entry:.4f}, qty={qty:.4f}")
+            else:
+                # API báo không còn vị thế, reset
+                self._reset_symbol_position(symbol)
+        except Exception as e:
+            logger.error(f"Lỗi cập nhật vị thế từ API {symbol}: {str(e)}")
 
     def _check_symbol_position(self, symbol):
         try:
@@ -1798,14 +1828,20 @@ class BaseBot:
 
                 result = place_order(symbol, close_side, qty, self.api_key, self.api_secret)
                 if result and 'orderId' in result:
-                    self.log(f"🔴 Đã đóng vị thế {symbol} {reason}")
-                    time.sleep(1)
-                    _POSITION_CACHE.refresh(force=True)
-                    self._reset_symbol_position(symbol)
-
-                    if self.find_new_bot_after_close and not self.symbol:
-                        self.status = "searching"
-                    return True
+                    self.log(f"🔴 Đã gửi lệnh đóng vị thế {symbol} {reason}")
+                    time.sleep(1)  # chờ khớp lệnh
+                    
+                    # CẢI TIẾN: Xác nhận lại bằng API sau khi đóng
+                    confirm_pos = self._force_check_position(symbol)
+                    if not confirm_pos:
+                        _POSITION_CACHE.refresh(force=True)
+                        self._reset_symbol_position(symbol)
+                        self.log(f"✅ Đã xác nhận đóng thành công {symbol}")
+                        return True
+                    else:
+                        self.log(f"⚠️ {symbol} - Đã gửi lệnh đóng nhưng vẫn còn vị thế? Sẽ thử lại sau.")
+                        # Có thể thử đóng lại? Tạm thời không, để bot chu kỳ sau xử lý
+                        return False
                 else:
                     self.log(f"❌ Đóng lệnh {symbol} thất bại")
                     return False
@@ -1866,20 +1902,11 @@ class BaseBot:
         if not data['position_open']:
             return
 
-        # FIX: Lấy thông tin vị thế mới nhất từ API
-        real_pos = self._force_check_position(symbol)
-        if not real_pos:
-            self._reset_symbol_position(symbol)
-            return
-
-        entry = float(real_pos.get('entryPrice', data['entry']))
-        qty = float(real_pos.get('positionAmt', data['qty']))
-        side = 'BUY' if qty > 0 else 'SELL'
-
-        # Cập nhật lại dữ liệu bot
-        data['entry'] = entry
-        data['qty'] = qty
-        data['side'] = side
+        # FIX: Lấy thông tin vị thế mới nhất từ API (đã được cập nhật qua _update_position_from_api)
+        # Ở đây dùng entry đã được cập nhật trong data
+        entry = data['entry']
+        qty = data['qty']
+        side = data['side']
 
         if entry <= 0 or abs(qty) <= 0:
             self.log(f"⚠️ {symbol} - entry hoặc qty không hợp lệ, bỏ qua TP/SL")
@@ -1918,19 +1945,10 @@ class BaseBot:
         if data['pyramiding_count'] >= self.pyramiding_n:
             return
 
-        # FIX: Lấy entry mới từ API
-        real_pos = self._force_check_position(symbol)
-        if real_pos:
-            entry = float(real_pos.get('entryPrice', data['entry_base']))
-            qty = float(real_pos.get('positionAmt', data['qty']))
-            data['entry'] = entry
-            data['qty'] = qty
-            data['entry_base'] = entry   # giữ entry_base gốc? Thực tế nên dùng entry gốc để tính ROI nhồi lệnh
-        else:
-            entry = data['entry_base']
-
+        # FIX: Lấy entry mới từ API (đã được cập nhật)
+        entry = data['entry']  # entry đã được cập nhật thường xuyên
         if entry <= 0:
-            self.log(f"⚠️ {symbol} - entry_base <= 0, bỏ qua pyramiding")
+            self.log(f"⚠️ {symbol} - entry <= 0, bỏ qua pyramiding")
             return
 
         current_price = self.get_current_price(symbol)
@@ -2027,16 +2045,9 @@ class BaseBot:
         if not data['position_open']:
             return False
 
-        # FIX: Lấy entry mới từ API
-        real_pos = self._force_check_position(symbol)
-        if real_pos:
-            entry = float(real_pos.get('entryPrice', data['entry_base']))
-            qty = float(real_pos.get('positionAmt', data['qty']))
-            data['entry'] = entry
-            data['qty'] = qty
-        else:
-            entry = data['entry_base']
-
+        # FIX: Lấy entry mới từ API (đã được cập nhật)
+        entry = data['entry']
+        qty = data['qty']
         if entry <= 0 or qty == 0:
             return False
 
@@ -2133,6 +2144,8 @@ class BotManager:
 
         if api_key and api_secret:
             _POSITION_CACHE.initialize(api_key, api_secret)
+            # CẢI TIẾN: Đặt TTL cache vị thế xuống 1 giây để phản ứng nhanh hơn
+            _POSITION_CACHE._ttl = 1
             self._verify_api_connection()
             self.log("🟢 HỆ THỐNG BOT CÂN BẰNG LỆNH (USDT/USDC) ĐÃ KHỞI ĐỘNG")
             self._initialize_cache()
@@ -2171,7 +2184,8 @@ class BotManager:
     def _position_cache_updater(self):
         while self.running:
             try:
-                time.sleep(3)  # FIX: giảm xuống 3 giây
+                # CẢI TIẾN: refresh mỗi 1 giây
+                time.sleep(1)
                 _POSITION_CACHE.refresh()
             except Exception as e:
                 logger.error(f"❌ Lỗi làm mới cache vị thế: {str(e)}")
@@ -2426,7 +2440,7 @@ class BotManager:
             self.log("❌ Không thể tạo bot")
             return False
 
-    # ----- Các phương thức dừng coin, bot... (giữ nguyên) -----
+    # ----- Các phương thức dừng coin, bot... -----
     def stop_coin(self, symbol):
         stopped_count = 0
         symbol = symbol.upper()
@@ -2501,7 +2515,7 @@ class BotManager:
             self.stop_bot(bot_id)
         self.log("🔴 Đã dừng tất cả bot, hệ thống vẫn chạy")
 
-    # ----- Telegram listener cải tiến với thread pool (giữ nguyên) -----
+    # ----- Telegram listener cải tiến với thread pool -----
     def _telegram_listener(self):
         last_update_id = 0
         executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='tg_handler')
