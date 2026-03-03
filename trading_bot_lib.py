@@ -912,6 +912,266 @@ class WebSocketManager:
             self.remove_symbol(symbol)
         self.executor.shutdown(wait=False)
 
+# ========== LỚP QUẢN LÝ CỐT LÕI ==========
+class CoinManager:
+    def __init__(self):
+        self.active_coins = set()
+        self._lock = threading.RLock()
+
+    def register_coin(self, symbol):
+        if not symbol: return
+        with self._lock: self.active_coins.add(symbol.upper())
+
+    def unregister_coin(self, symbol):
+        if not symbol: return
+        with self._lock: self.active_coins.discard(symbol.upper())
+
+    def is_coin_active(self, symbol):
+        if not symbol: return False
+        with self._lock: return symbol.upper() in self.active_coins
+
+    def get_active_coins(self):
+        with self._lock: return list(self.active_coins)
+
+class BotExecutionCoordinator:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._bot_queue = queue.Queue()
+        self._current_finding_bot = None
+        self._found_coins = set()
+        self._bots_with_coins = set()
+        # Thêm blacklist tạm thời
+        self._temp_blacklist = {}          # symbol -> expiry timestamp
+        self._blacklist_lock = threading.RLock()
+
+    def add_temp_blacklist(self, symbol, duration=300):
+        """Đưa coin vào blacklist tạm thời trong `duration` giây (mặc định 5 phút)."""
+        expiry = time.time() + duration
+        with self._blacklist_lock:
+            self._temp_blacklist[symbol.upper()] = expiry
+        logger.info(f"⏳ Blacklist tạm: {symbol} trong {duration}s")
+
+    def is_temp_blacklisted(self, symbol):
+        """Kiểm tra coin có đang bị blacklist tạm không (tự động dọn dẹp hết hạn)."""
+        symbol = symbol.upper()
+        now = time.time()
+        with self._blacklist_lock:
+            # Xoá các mục hết hạn
+            expired = [s for s, exp in self._temp_blacklist.items() if exp <= now]
+            for s in expired:
+                del self._temp_blacklist[s]
+            return symbol in self._temp_blacklist
+
+    def release_coin(self, symbol):
+        """Xoá coin khỏi danh sách `_found_coins` (giải phóng để bot khác dùng)."""
+        with self._lock:
+            self._found_coins.discard(symbol.upper())
+
+    def request_coin_search(self, bot_id):
+        with self._lock:
+            if bot_id in self._bots_with_coins:
+                return False
+            if self._current_finding_bot is None or self._current_finding_bot == bot_id:
+                self._current_finding_bot = bot_id
+                return True
+            else:
+                if bot_id not in list(self._bot_queue.queue):
+                    self._bot_queue.put(bot_id)
+                return False
+
+    def finish_coin_search(self, bot_id, found_symbol=None, has_coin_now=False):
+        next_bot = None
+        with self._lock:
+            if self._current_finding_bot == bot_id:
+                self._current_finding_bot = None
+                if found_symbol:
+                    self._found_coins.add(found_symbol)
+                if has_coin_now:
+                    self._bots_with_coins.add(bot_id)
+                if not self._bot_queue.empty():
+                    try:
+                        next_bot = self._bot_queue.get_nowait()
+                        self._current_finding_bot = next_bot
+                    except queue.Empty:
+                        pass
+        return next_bot
+
+    def bot_has_coin(self, bot_id):
+        with self._lock:
+            self._bots_with_coins.add(bot_id)
+            # Xóa khỏi queue nếu đang nằm trong đó
+            new_queue = queue.Queue()
+            while not self._bot_queue.empty():
+                try:
+                    bot_in_queue = self._bot_queue.get_nowait()
+                    if bot_in_queue != bot_id:
+                        new_queue.put(bot_in_queue)
+                except queue.Empty:
+                    break
+            self._bot_queue = new_queue
+
+    def bot_lost_coin(self, bot_id):
+        with self._lock:
+            self._bots_with_coins.discard(bot_id)
+
+    def remove_bot(self, bot_id):
+        """Xóa bot khỏi tất cả cấu trúc (gọi khi bot dừng)"""
+        with self._lock:
+            if self._current_finding_bot == bot_id:
+                self._current_finding_bot = None
+            self._bots_with_coins.discard(bot_id)
+            # Xóa khỏi queue
+            new_queue = queue.Queue()
+            while not self._bot_queue.empty():
+                try:
+                    bot_in_queue = self._bot_queue.get_nowait()
+                    if bot_in_queue != bot_id:
+                        new_queue.put(bot_in_queue)
+                except queue.Empty:
+                    break
+            self._bot_queue = new_queue
+
+    def is_coin_available(self, symbol):
+        with self._lock: return symbol not in self._found_coins
+
+    def bot_processing_coin(self, bot_id):
+        with self._lock:
+            self._bots_with_coins.add(bot_id)
+            new_queue = queue.Queue()
+            while not self._bot_queue.empty():
+                try:
+                    bot_in_queue = self._bot_queue.get_nowait()
+                    if bot_in_queue != bot_id:
+                        new_queue.put(bot_in_queue)
+                except queue.Empty:
+                    break
+            self._bot_queue = new_queue
+
+    def get_queue_info(self):
+        with self._lock:
+            return {
+                'current_finding': self._current_finding_bot,
+                'queue_size': self._bot_queue.qsize(),
+                'queue_bots': list(self._bot_queue.queue),
+                'bots_with_coins': list(self._bots_with_coins),
+                'found_coins_count': len(self._found_coins)
+            }
+
+    def get_queue_position(self, bot_id):
+        with self._lock:
+            if self._current_finding_bot == bot_id:
+                return 0
+            else:
+                queue_list = list(self._bot_queue.queue)
+                return queue_list.index(bot_id) + 1 if bot_id in queue_list else -1
+
+class SmartCoinFinder:
+    def __init__(self, api_key, api_secret):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.last_scan_time = 0
+        self.scan_cooldown = 30
+        self.position_counts = {"BUY": 0, "SELL": 0}
+        self.last_position_count_update = 0
+        self._bot_manager = None
+        self.last_failed_search_log = 0
+        self.bot_leverage = 10
+
+    def set_bot_manager(self, bot_manager):
+        self._bot_manager = bot_manager
+
+    def update_position_counts(self):
+        """Cập nhật số lượng lệnh BUY/SELL hiện tại từ API"""
+        try:
+            positions = get_positions(api_key=self.api_key, api_secret=self.api_secret)
+            long_count = 0
+            short_count = 0
+            for pos in positions:
+                amt = float(pos.get('positionAmt', 0))
+                if amt > 0:
+                    long_count += 1
+                elif amt < 0:
+                    short_count += 1
+            self.position_counts = {"BUY": long_count, "SELL": short_count}
+            self.last_position_count_update = time.time()
+            logger.info(f"📊 Cân bằng lệnh: BUY={long_count}, SELL={short_count}")
+        except Exception as e:
+            logger.error(f"❌ Lỗi cập nhật số lượng lệnh: {str(e)}")
+
+    def get_next_side_for_balance(self):
+        if time.time() - self.last_position_count_update > 30:
+            self.update_position_counts()
+        if self.position_counts["BUY"] > self.position_counts["SELL"]:
+            return "SELL"
+        elif self.position_counts["SELL"] > self.position_counts["BUY"]:
+            return "BUY"
+        else:
+            return random.choice(["BUY", "SELL"])
+
+    def get_symbol_leverage(self, symbol):
+        return get_max_leverage_from_cache(symbol)
+
+    def has_existing_position(self, symbol):
+        """Kiểm tra vị thế qua API trực tiếp"""
+        try:
+            pos = get_positions(symbol, self.api_key, self.api_secret)
+            return len(pos) > 0 and abs(float(pos[0].get('positionAmt', 0))) > 0
+        except Exception as e:
+            logger.error(f"Lỗi kiểm tra vị thế {symbol}: {str(e)}")
+            return False
+
+    def find_best_coin_with_balance(self, excluded_coins=None):
+        try:
+            now = time.time()
+            if now - self.last_scan_time < self.scan_cooldown:
+                return None
+            self.last_scan_time = now
+
+            coins = get_coins_with_info()
+            if not coins:
+                logger.warning("⚠️ Cache coin trống, không thể tìm coin.")
+                return None
+
+            if self._bot_manager and hasattr(self._bot_manager, 'global_side_coordinator'):
+                target_side = self._bot_manager.global_side_coordinator.get_next_side(
+                    self.api_key, self.api_secret
+                )
+            else:
+                target_side = self.get_next_side_for_balance()
+
+            logger.info(f"🎯 Hệ thống chọn hướng: {target_side} (đòn bẩy bot: {self.bot_leverage}x)")
+
+            filtered_coins = filter_coins_for_side(
+                target_side,
+                excluded_coins
+            )
+
+            if not filtered_coins:
+                if now - self.last_failed_search_log > 60:
+                    logger.warning(f"⚠️ Không tìm thấy coin phù hợp cho hướng {target_side}")
+                    self.last_failed_search_log = now
+                return None
+
+            # Lọc bỏ coin đang trong blacklist tạm thời
+            for coin in filtered_coins:
+                symbol = coin['symbol']
+                if self._bot_manager and self._bot_manager.bot_coordinator.is_temp_blacklisted(symbol):
+                    continue
+                if self.has_existing_position(symbol):
+                    continue
+                if self._bot_manager and self._bot_manager.coin_manager.is_coin_active(symbol):
+                    continue
+                logger.info(f"✅ Tìm thấy coin {symbol} phù hợp ({target_side}) | volume: {coin['volume']:.2f}")
+                return symbol
+
+            logger.warning(f"⚠️ Đã duyệt {len(filtered_coins)} coin nhưng không có coin nào chưa có vị thế")
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ Lỗi tìm coin với cân bằng: {str(e)}")
+            logger.error(traceback.format_exc())
+            return None
+
 # ========== LỚP BOT CỐT LÕI (PHẦN 1: KHỞI TẠO VÀ PHƯƠNG THỨC PHỤ TRỢ) ==========
 class BaseBot:
     def __init__(self, symbol, lev, percent, tp, sl, roi_trigger, ws_manager, api_key, api_secret,
