@@ -1,8 +1,8 @@
-# trading_bot_lib_merged_v2_part1.py
+# trading_bot_lib_merged_v2_part1_fixed.py
 # =============================================================================
 #  KẾT HỢP: LOGIC XỬ LÝ LỆNH TỪ FILE 8 (nguyên bản, không sửa)
 #            + CACHE & API TỪ FILE 7 (để tránh rate limit)
-#  (Phần 1: đến trước class BotManager)
+#  (Phần 1: đến trước class BotManager) - ĐÃ SỬA LỖI PYRAMIDING
 # =============================================================================
 
 import json
@@ -1197,7 +1197,7 @@ class WebSocketManager:
             self.remove_symbol(symbol)
         self.executor.shutdown(wait=False)
 
-# ========== LỚP BOT CỐT LÕI (NGUYÊN BẢN LOGIC TỪ FILE 8) ==========
+# ========== LỚP BOT CỐT LÕI (ĐÃ SỬA LỖI PYRAMIDING) ==========
 class BaseBot:
     def __init__(self, symbol, lev, percent, tp, sl, roi_trigger, ws_manager, api_key, api_secret,
                  telegram_bot_token, telegram_chat_id, strategy_name, config_key=None, bot_id=None,
@@ -1848,6 +1848,7 @@ class BaseBot:
             return
 
     def _check_pyramiding(self, symbol):
+        """Kiểm tra và thực hiện nhồi lệnh nếu đủ điều kiện (ĐÃ SỬA LỖI)"""
         if not self.pyramiding_enabled:
             return
         if symbol not in self.symbol_data:
@@ -1858,18 +1859,22 @@ class BaseBot:
         if data['pyramiding_count'] >= self.pyramiding_n:
             return
 
+        # Lấy thông tin vị thế mới nhất từ API (nếu có)
         real_pos = self._force_check_position(symbol)
         if real_pos:
             entry = float(real_pos.get('entryPrice', data['entry_base']))
             qty = float(real_pos.get('positionAmt', data['qty']))
             data['entry'] = entry
             data['qty'] = qty
-            data['entry_base'] = entry
+            # Chỉ cập nhật entry_base khi lấy được từ API? 
+            # Thực tế entry_base nên là giá entry ban đầu, không thay đổi khi nhồi? 
+            # Nhưng khi nhồi, entry_base sẽ được cập nhật trong _pyramid_order.
+            # Ở đây ta giữ nguyên entry_base (sẽ được cập nhật khi nhồi thành công)
         else:
-            entry = data['entry_base']
+            entry = data['entry_base']  # fallback về entry_base nếu không lấy được API
 
         if entry <= 0:
-            self.log(f"⚠️ {symbol} - entry_base <= 0, bỏ qua pyramiding")
+            self.log(f"⚠️ {symbol} - entry <= 0, bỏ qua pyramiding")
             return
 
         current_price = self.get_current_price(symbol)
@@ -1882,18 +1887,28 @@ class BaseBot:
             roi = (entry - current_price) / entry * 100 * self.lev
 
         next_roi = data['next_pyramiding_roi']
+
+        # Log debug để theo dõi
+        self.log(f"🔍 [DEBUG] {symbol} roi={roi:.2f}% next_roi={next_roi:.2f}% count={data['pyramiding_count']}")
+
         if roi >= next_roi:
-            self._pyramid_order(symbol, data['side'])
-            data['pyramiding_count'] += 1
-            data['next_pyramiding_roi'] = next_roi + self.pyramiding_x
-            data['last_pyramiding_time'] = time.time()
-            self.log(f"🔄 Nhồi lệnh {symbol} lần {data['pyramiding_count']} tại ROI {roi:.2f}%")
+            self.log(f"📈 {symbol} đạt ROI {roi:.2f}% >= ngưỡng {next_roi:.2f}%, tiến hành nhồi lệnh lần {data['pyramiding_count']+1}")
+            success = self._pyramid_order(symbol, data['side'])
+            if success:
+                data['pyramiding_count'] += 1
+                data['next_pyramiding_roi'] = next_roi + self.pyramiding_x
+                data['last_pyramiding_time'] = time.time()
+                self.log(f"🔄 Nhồi lệnh {symbol} lần {data['pyramiding_count']} thành công tại ROI {roi:.2f}%")
+            else:
+                self.log(f"⚠️ Nhồi lệnh {symbol} thất bại, giữ nguyên số lần và ngưỡng")
 
     def _pyramid_order(self, symbol, side):
+        """Đặt lệnh nhồi thêm, trả về True nếu thành công (ĐÃ SỬA LỖI)"""
         try:
             total_balance, available_balance = get_total_and_available_balance(self.api_key, self.api_secret)
             if total_balance is None or total_balance <= 0:
-                return
+                self.log(f"❌ {symbol} - Không thể lấy tổng số dư để nhồi lệnh")
+                return False
 
             usd_amount = total_balance * (self.percent / 100)
 
@@ -1902,17 +1917,18 @@ class BaseBot:
 
             current_price = self._get_fresh_price(symbol)
             if current_price <= 0:
-                return
+                self.log(f"❌ {symbol} - Lỗi giá khi nhồi lệnh")
+                return False
 
             if self.enable_balance_orders:
                 buy_threshold = _BALANCE_CONFIG.get("buy_price_threshold", 1.0)
                 sell_threshold = _BALANCE_CONFIG.get("sell_price_threshold", 10.0)
                 if side == "BUY" and current_price >= buy_threshold:
                     self.log(f"⚠️ Không nhồi lệnh {symbol}: giá {current_price:.4f} >= ngưỡng mua {buy_threshold}")
-                    return
+                    return False
                 if side == "SELL" and current_price <= sell_threshold:
                     self.log(f"⚠️ Không nhồi lệnh {symbol}: giá {current_price:.4f} <= ngưỡng bán {sell_threshold}")
-                    return
+                    return False
 
             step_size = get_step_size(symbol)
             min_qty = get_min_qty_from_cache(symbol)
@@ -1925,13 +1941,14 @@ class BaseBot:
 
             if qty < min_qty:
                 self.log(f"⚠️ Không thể nhồi lệnh {symbol}: khối lượng {qty} < minQty {min_qty}")
-                return
+                return False
             notional_value = qty * current_price
             if notional_value < min_notional:
                 self.log(f"⚠️ Không thể nhồi lệnh {symbol}: giá trị {notional_value:.2f} < {min_notional} (minNotional)")
-                return
+                return False
             if qty <= 0:
-                return
+                self.log(f"⚠️ Không thể nhồi lệnh {symbol}: khối lượng không hợp lệ")
+                return False
 
             result = place_order(symbol, side, qty, self.api_key, self.api_secret)
             if result and 'orderId' in result:
@@ -1940,7 +1957,7 @@ class BaseBot:
 
                 if executed_qty < 0:
                     self.log(f"⚠️ Lệnh nhồi {symbol} không khớp")
-                    return
+                    return False
 
                 old_qty = self.symbol_data[symbol]['qty']
                 old_entry = self.symbol_data[symbol]['entry']
@@ -1951,10 +1968,17 @@ class BaseBot:
                 self.symbol_data[symbol].update({
                     'qty': new_qty,
                     'entry': new_entry,
+                    'entry_base': new_entry,  # Cập nhật cả entry_base để ROI sau tính đúng
                 })
                 self.log(f"➕ Đã nhồi thêm {executed_qty} {symbol} giá {avg_price}")
+                return True
+            else:
+                error_msg = result.get('msg', 'Không có phản hồi') if result else 'Không có phản hồi'
+                self.log(f"❌ Lệnh nhồi {symbol} thất bại: {error_msg}")
+                return False
         except Exception as e:
             self.log(f"❌ Lỗi nhồi lệnh {symbol}: {str(e)}")
+            return False
 
     def _check_smart_exit_condition(self, symbol):
         if not self.roi_trigger:
@@ -2046,9 +2070,7 @@ class BaseBot:
 class GlobalMarketBot(BaseBot):
     pass
 
-# ========== KẾT THÚC PHẦN 1 - TIẾP THEO LÀ BOTMANAGER (SẼ CÓ TRONG PHẦN 2) ==========
-
-# ========== LỚP QUẢN LÝ BOT (BOTMANAGER) - TỪ FILE 7, ĐIỀU CHỈNH NHẸ ==========
+# ========== KẾT THÚC PHẦN 1 - TIẾP THEO LÀ BOTMANAGER ==========
 
 class BotManager:
     def __init__(self, api_key=None, api_secret=None, telegram_bot_token=None, telegram_chat_id=None):
