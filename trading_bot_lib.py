@@ -1,8 +1,7 @@
 # trading_bot_lib_merged_v2_part1_fixed.py
 # =============================================================================
-#  KẾT HỢP: LOGIC XỬ LÝ LỆNH TỪ FILE 8 (nguyên bản, không sửa)
-#            + CACHE & API TỪ FILE 7 (để tránh rate limit)
-#  (Phần 1: đến trước class BotManager) - ĐÃ SỬA LỖI PYRAMIDING
+#  KẾT HỢP: LOGIC XỬ LÝ LỆNH TỪ FILE 8 + CACHE & API TỪ FILE 7
+#  (Phần 1: đến trước class BotManager) - ĐÃ SỬA LỖI PYRAMIDING & ROI = 0
 # =============================================================================
 
 import json
@@ -29,15 +28,14 @@ import html
 import sys
 from typing import Optional, List, Dict, Any, Tuple, Callable
 
-# ========== CẤU HÌNH & HẰNG SỐ (TỪ FILE 7) ==========
+# ========== CẤU HÌNH & HẰNG SỐ ==========
 _BINANCE_LAST_REQUEST_TIME = 0
 _BINANCE_RATE_LOCK = threading.RLock()
-_BINANCE_MIN_INTERVAL = 0.2  # Từ file 7
+_BINANCE_MIN_INTERVAL = 0.2
 
-# Blacklist mở rộng cho cả USDT và USDC
 _SYMBOL_BLACKLIST = {'BTCUSDT', 'ETHUSDT', 'BTCUSDC', 'ETHUSDC'}
 
-# ========== CACHE COIN TẬP TRUNG (TỪ FILE 7) ==========
+# ========== CACHE COIN TẬP TRUNG ==========
 class CoinCache:
     def __init__(self):
         self._data: List[Dict] = []
@@ -81,7 +79,7 @@ class CoinCache:
 
 _COINS_CACHE = CoinCache()
 
-# ========== CẤU HÌNH CÂN BẰNG LỆNH (TỪ FILE 7) ==========
+# ========== CẤU HÌNH CÂN BẰNG LỆNH ==========
 class BalanceConfig:
     def __init__(self):
         self._config = {
@@ -108,7 +106,7 @@ class BalanceConfig:
 
 _BALANCE_CONFIG = BalanceConfig()
 
-# ========== QUẢN LÝ HƯỚNG TOÀN CỤC (TỪ FILE 7) ==========
+# ========== QUẢN LÝ HƯỚNG TOÀN CỤC ==========
 class GlobalSideCoordinator:
     def __init__(self):
         self._lock = threading.RLock()
@@ -155,7 +153,7 @@ class GlobalSideCoordinator:
     def get_next_side(self, api_key, api_secret):
         return self.update_global_counts(api_key, api_secret)
 
-# ========== HÀM TIỆN ÍCH (TỪ FILE 7) ==========
+# ========== HÀM TIỆN ÍCH ==========
 def setup_logging():
     logging.basicConfig(
         level=logging.INFO,
@@ -188,7 +186,7 @@ def send_telegram(message, chat_id=None, reply_markup=None, bot_token=None, defa
     except Exception as e:
         logger.error(f"Lỗi kết nối Telegram: {str(e)}")
 
-# ========== HÀM TẠO BÀN PHÍM (GIỮ NGUYÊN TỪ FILE 7) ==========
+# ========== HÀM TẠO BÀN PHÍM (giữ nguyên) ==========
 def create_main_menu():
     return {
         "keyboard": [
@@ -342,7 +340,7 @@ def create_price_threshold_keyboard():
         "resize_keyboard": True, "one_time_keyboard": True
     }
 
-# ========== HÀM API BINANCE CẢI TIẾN (TỪ FILE 7) ==========
+# ========== HÀM API BINANCE CẢI TIẾN ==========
 def _wait_for_rate_limit():
     global _BINANCE_LAST_REQUEST_TIME
     with _BINANCE_RATE_LOCK:
@@ -428,7 +426,7 @@ def binance_api_request(url, method='GET', params=None, headers=None):
     logger.error(f"❌ Thất bại yêu cầu API sau {max_retries} lần thử: {base_url}")
     return None
 
-# ========== HÀM CACHE COIN (TỪ FILE 7) ==========
+# ========== HÀM CACHE COIN ==========
 def refresh_coins_cache():
     try:
         url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -577,7 +575,7 @@ def force_refresh_coin_cache():
         return True
     return False
 
-# ========== HÀM LỌC COIN (TỪ FILE 7) ==========
+# ========== HÀM LỌC COIN ==========
 def filter_coins_for_side(side, excluded_coins=None):
     all_coins = get_coins_with_info()
     filtered = []
@@ -639,7 +637,7 @@ def update_balance_config(buy_price_threshold=None, sell_price_threshold=None, m
     logger.info(f"✅ Cập nhật cấu hình cân bằng: {_BALANCE_CONFIG.get_all()}")
     return _BALANCE_CONFIG.get_all()
 
-# ========== CÁC HÀM API BINANCE KHÁC (TỪ FILE 7) ==========
+# ========== CÁC HÀM API BINANCE KHÁC ==========
 def set_leverage(symbol, lev, api_key, api_secret):
     if not symbol: return False
     try:
@@ -789,7 +787,33 @@ def get_current_price(symbol):
         logger.error(f"Lỗi giá {symbol}: {str(e)}")
         return 0
 
-# ========== CACHE VỊ THẾ TẬP TRUNG (TỪ FILE 7) ==========
+# ========== HÀM LẤY MARK PRICE (CACHE 2s) ==========
+def get_mark_price(symbol):
+    """Lấy mark price từ Binance, cache 2 giây để tránh rate limit"""
+    if not symbol:
+        return 0
+    cache_key = f"mark_{symbol}"
+    now = time.time()
+    # Kiểm tra cache
+    if hasattr(get_mark_price, 'cache') and cache_key in get_mark_price.cache:
+        price, ts = get_mark_price.cache[cache_key]
+        if now - ts < 2:
+            return price
+    try:
+        url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol.upper()}"
+        data = binance_api_request(url)
+        if data and 'markPrice' in data:
+            price = float(data['markPrice'])
+            # Lưu cache
+            if not hasattr(get_mark_price, 'cache'):
+                get_mark_price.cache = {}
+            get_mark_price.cache[cache_key] = (price, now)
+            return price
+    except Exception as e:
+        logger.error(f"Lỗi lấy mark price {symbol}: {e}")
+    return get_current_price(symbol)  # fallback
+
+# ========== CACHE VỊ THẾ TẬP TRUNG ==========
 class PositionCache:
     def __init__(self):
         self._positions = []
@@ -877,7 +901,7 @@ def get_positions(symbol=None, api_key=None, api_secret=None):
         logger.error(f"Lỗi vị thế: {str(e)}")
         return []
 
-# ========== LỚP QUẢN LÝ CỐT LÕI (TỪ FILE 7, NHƯNG GIỮ NGUYÊN TÊN) ==========
+# ========== LỚP QUẢN LÝ CỐT LÕI ==========
 class CoinManager:
     def __init__(self):
         self.active_coins = set()
@@ -1117,7 +1141,7 @@ class SmartCoinFinder:
             logger.error(traceback.format_exc())
             return None
 
-# ========== WEBSOCKET MANAGER (TỪ FILE 7) ==========
+# ========== WEBSOCKET MANAGER ==========
 class WebSocketManager:
     def __init__(self):
         self.connections = {}
@@ -1197,7 +1221,7 @@ class WebSocketManager:
             self.remove_symbol(symbol)
         self.executor.shutdown(wait=False)
 
-# ========== LỚP BOT CỐT LÕI (ĐÃ SỬA LỖI PYRAMIDING) ==========
+# ========== LỚP BOT CỐT LÕI (ĐÃ SỬA LỖI PYRAMIDING & ROI) ==========
 class BaseBot:
     def __init__(self, symbol, lev, percent, tp, sl, roi_trigger, ws_manager, api_key, api_secret,
                  telegram_bot_token, telegram_chat_id, strategy_name, config_key=None, bot_id=None,
@@ -1264,7 +1288,6 @@ class BaseBot:
 
         self.bot_coordinator = bot_coordinator or BotExecutionCoordinator()
 
-        # Thêm cấu hình cân bằng từ file 7, nhưng không ảnh hưởng logic chính
         self.enable_balance_orders = kwargs.get('enable_balance_orders', True)
         self.balance_config = {
             'buy_price_threshold': kwargs.get('buy_price_threshold', 1.0),
@@ -1296,7 +1319,7 @@ class BaseBot:
         self.log(f"🟢 Bot {strategy_name} đã khởi động | 1 coin | Đòn bẩy: {lev}x | Vốn: {percent}% | TP/SL: {self.tp}%/{self.sl}%{roi_info}{pyramiding_info}{balance_info}")
 
     def _run(self):
-        """Vòng lặp chính - CHỈ CHUYỂN QUYỀN KHI ĐÃ VÀO LỆNH THÀNH CÔNG (NGUYÊN BẢN TỪ FILE 8)"""
+        """Vòng lặp chính - giữ nguyên"""
         last_coin_search_log = 0
         log_interval = 30
         last_no_coin_found_log = 0
@@ -1375,7 +1398,7 @@ class BaseBot:
                 time.sleep(5)
 
     def _process_single_symbol(self, symbol):
-        """Xử lý một symbol duy nhất - TRẢ VỀ True NẾU VỪA VÀO LỆNH THÀNH CÔNG (NGUYÊN BẢN TỪ FILE 8)"""
+        """Xử lý một symbol - giữ nguyên"""
         try:
             if symbol not in self.symbol_data:
                 return False
@@ -1459,6 +1482,7 @@ class BaseBot:
         return price
 
     def _force_check_position(self, symbol):
+        """Gọi API trực tiếp để lấy vị thế mới nhất (bao gồm entryPrice)"""
         try:
             positions = get_positions(symbol, self.api_key, self.api_secret)
             if positions and len(positions) > 0:
@@ -1809,28 +1833,31 @@ class BaseBot:
         if not data['position_open']:
             return
 
+        # Lấy entry mới nhất từ API
         real_pos = self._force_check_position(symbol)
-        if not real_pos:
-            self._reset_symbol_position(symbol)
-            return
+        if real_pos:
+            entry = float(real_pos.get('entryPrice', data['entry']))
+            qty = float(real_pos.get('positionAmt', data['qty']))
+            side = 'BUY' if qty > 0 else 'SELL'
+            data['entry'] = entry
+            data['qty'] = qty
+            data['side'] = side
+        else:
+            entry = data['entry']
 
-        entry = float(real_pos.get('entryPrice', data['entry']))
-        qty = float(real_pos.get('positionAmt', data['qty']))
-        side = 'BUY' if qty > 0 else 'SELL'
-
-        data['entry'] = entry
-        data['qty'] = qty
-        data['side'] = side
-
-        if entry <= 0 or abs(qty) <= 0:
+        if entry <= 0 or abs(data['qty']) <= 0:
             self.log(f"⚠️ {symbol} - entry hoặc qty không hợp lệ, bỏ qua TP/SL")
             return
 
-        current_price = self.get_current_price(symbol)
+        # Lấy giá hiện tại (ưu tiên mark price)
+        current_price = get_mark_price(symbol)
         if current_price <= 0:
+            current_price = self.get_current_price(symbol)
+        if current_price <= 0:
+            self.log(f"⚠️ {symbol} - không có giá, bỏ qua TP/SL")
             return
 
-        if side == 'BUY':
+        if data['side'] == 'BUY':
             roi = (current_price - entry) / entry * 100 * self.lev
         else:
             roi = (entry - current_price) / entry * 100 * self.lev
@@ -1859,26 +1886,27 @@ class BaseBot:
         if data['pyramiding_count'] >= self.pyramiding_n:
             return
 
-        # Lấy thông tin vị thế mới nhất từ API (nếu có)
+        # Lấy entry mới nhất từ API (ưu tiên)
         real_pos = self._force_check_position(symbol)
         if real_pos:
-            entry = float(real_pos.get('entryPrice', data['entry_base']))
-            qty = float(real_pos.get('positionAmt', data['qty']))
-            data['entry'] = entry
-            data['qty'] = qty
-            # Chỉ cập nhật entry_base khi lấy được từ API? 
-            # Thực tế entry_base nên là giá entry ban đầu, không thay đổi khi nhồi? 
-            # Nhưng khi nhồi, entry_base sẽ được cập nhật trong _pyramid_order.
-            # Ở đây ta giữ nguyên entry_base (sẽ được cập nhật khi nhồi thành công)
+            entry = float(real_pos.get('entryPrice', 0))
+            if entry > 0:
+                data['entry'] = entry
+            else:
+                entry = data['entry']  # fallback về entry cũ
         else:
-            entry = data['entry_base']  # fallback về entry_base nếu không lấy được API
+            entry = data['entry']
 
         if entry <= 0:
             self.log(f"⚠️ {symbol} - entry <= 0, bỏ qua pyramiding")
             return
 
-        current_price = self.get_current_price(symbol)
+        # Lấy giá hiện tại (ưu tiên mark price)
+        current_price = get_mark_price(symbol)
         if current_price <= 0:
+            current_price = self.get_current_price(symbol)
+        if current_price <= 0:
+            self.log(f"⚠️ {symbol} - không có giá, bỏ qua pyramiding")
             return
 
         if data['side'] == 'BUY':
@@ -1889,7 +1917,7 @@ class BaseBot:
         next_roi = data['next_pyramiding_roi']
 
         # Log debug để theo dõi
-        self.log(f"🔍 [DEBUG] {symbol} roi={roi:.2f}% next_roi={next_roi:.2f}% count={data['pyramiding_count']}")
+        self.log(f"🔍 [DEBUG] {symbol} roi={roi:.2f}% next_roi={next_roi:.2f}% count={data['pyramiding_count']} entry={entry:.4f} price={current_price:.4f}")
 
         if roi >= next_roi:
             self.log(f"📈 {symbol} đạt ROI {roi:.2f}% >= ngưỡng {next_roi:.2f}%, tiến hành nhồi lệnh lần {data['pyramiding_count']+1}")
@@ -1968,7 +1996,7 @@ class BaseBot:
                 self.symbol_data[symbol].update({
                     'qty': new_qty,
                     'entry': new_entry,
-                    'entry_base': new_entry,  # Cập nhật cả entry_base để ROI sau tính đúng
+                    'entry_base': new_entry,  # QUAN TRỌNG: cập nhật entry_base để ROI sau tính đúng
                 })
                 self.log(f"➕ Đã nhồi thêm {executed_qty} {symbol} giá {avg_price}")
                 return True
@@ -1989,19 +2017,23 @@ class BaseBot:
         if not data['position_open']:
             return False
 
+        # Lấy entry mới nhất
         real_pos = self._force_check_position(symbol)
         if real_pos:
-            entry = float(real_pos.get('entryPrice', data['entry_base']))
+            entry = float(real_pos.get('entryPrice', data['entry']))
             qty = float(real_pos.get('positionAmt', data['qty']))
             data['entry'] = entry
             data['qty'] = qty
         else:
-            entry = data['entry_base']
+            entry = data['entry']
 
-        if entry <= 0 or qty == 0:
+        if entry <= 0 or data['qty'] == 0:
             return False
 
-        current_price = self.get_current_price(symbol)
+        # Lấy giá hiện tại (ưu tiên mark price)
+        current_price = get_mark_price(symbol)
+        if current_price <= 0:
+            current_price = self.get_current_price(symbol)
         if current_price <= 0:
             return False
 
@@ -2070,7 +2102,7 @@ class BaseBot:
 class GlobalMarketBot(BaseBot):
     pass
 
-# ========== KẾT THÚC PHẦN 1 - TIẾP THEO LÀ BOTMANAGER ==========
+# ========== KẾT THÚC PHẦN 1 ==========
 
 class BotManager:
     def __init__(self, api_key=None, api_secret=None, telegram_bot_token=None, telegram_chat_id=None):
