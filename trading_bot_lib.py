@@ -1874,6 +1874,25 @@ class BaseBot:
             return
 
     def _check_pyramiding(self, symbol):
+        data = self.symbol_data[symbol]
+        if not data['position_open']:
+            return
+        if data['pyramiding_count'] >= self.pyramiding_n:
+            return
+
+        # Lấy entry mới nhất từ API (ưu tiên)
+        real_pos = self._force_check_position(symbol)
+        if real_pos:
+            entry = float(real_pos.get('entryPrice', 0))
+            if entry > 0:
+                data['entry'] = entry
+            else:
+                entry = data['entry']  # fallback về entry cũ
+        else:
+            entry = data['entry']
+
+        current_price = get_mark_price(symbol)
+
         if data['side'] == 'BUY':
             roi = (current_price - entry) / entry * 100 * self.lev
         else:
