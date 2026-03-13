@@ -1916,7 +1916,7 @@ class BaseBot:
         next_roi = data['next_pyramiding_roi']
 
         if roi <= next_roi:
-            self.log(f"📈 {symbol} đạt ROI {roi:.2f}% >= ngưỡng {next_roi:.2f}%, tiến hành nhồi lệnh lần {data['pyramiding_count']+1}")
+            self.log(f"📈 {symbol} đạt ROI {roi:.2f}% <= ngưỡng {next_roi:.2f}%, tiến hành nhồi lệnh lần {data['pyramiding_count']+1}")
             success = self._pyramid_order(symbol, data['side'])
             if success:
                 data['pyramiding_count'] += 1
