@@ -1696,7 +1696,7 @@ class BaseBot:
                     if self.pyramiding_enabled:
                         pyramiding_info = {
                             'pyramiding_count': 0,
-                            'next_pyramiding_roi': self.pyramiding_x,
+                            'next_pyramiding_roi': -self.pyramiding_x,
                             'last_pyramiding_time': 0,
                             'pyramiding_base_roi': 0.0,
                         }
@@ -1920,7 +1920,7 @@ class BaseBot:
             success = self._pyramid_order(symbol, data['side'])
             if success:
                 data['pyramiding_count'] += 1
-                data['next_pyramiding_roi'] = next_roi + self.pyramiding_x
+                data['next_pyramiding_roi'] = next_roi - self.pyramiding_x
                 data['last_pyramiding_time'] = time.time()
                 self.log(f"🔄 Nhồi lệnh {symbol} lần {data['pyramiding_count']} thành công tại ROI {roi:.2f}%")
             else:
