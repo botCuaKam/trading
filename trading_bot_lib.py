@@ -1452,6 +1452,7 @@ class BaseBot:
             'next_pyramiding_roi': self.pyramiding_x if self.pyramiding_enabled else 0,
             'last_pyramiding_time': 0,
             'pyramiding_base_roi': 0.0,
+            'last_pyramid_fail_log_time': 0,
             'high_water_mark_roi': 0,
             'roi_check_activated': False
         }
@@ -1874,12 +1875,17 @@ class BaseBot:
             return
 
     def _check_pyramiding(self, symbol):
+        """Kiểm tra và thực hiện nhồi lệnh nếu đủ điều kiện (ĐÃ SỬA LỖI)"""
+        if not self.pyramiding_enabled:
+            return
+        if symbol not in self.symbol_data:
+            return
         data = self.symbol_data[symbol]
         if not data['position_open']:
             return
         if data['pyramiding_count'] >= self.pyramiding_n:
             return
-
+    
         # Lấy entry mới nhất từ API (ưu tiên)
         real_pos = self._force_check_position(symbol)
         if real_pos:
@@ -1887,108 +1893,120 @@ class BaseBot:
             if entry > 0:
                 data['entry'] = entry
             else:
-                entry = data['entry']  # fallback về entry cũ
+                entry = data['entry']
         else:
             entry = data['entry']
-
+    
+        if entry <= 0:
+            self.log(f"⚠️ {symbol} - entry <= 0, bỏ qua pyramiding")
+            return
+    
+        # Lấy giá hiện tại (ưu tiên mark price)
         current_price = get_mark_price(symbol)
-
+        if current_price <= 0:
+            current_price = self.get_current_price(symbol)
+        if current_price <= 0:
+            self.log(f"⚠️ {symbol} - không có giá, bỏ qua pyramiding")
+            return
+    
         if data['side'] == 'BUY':
             roi = (current_price - entry) / entry * 100 * self.lev
         else:
             roi = (entry - current_price) / entry * 100 * self.lev
-
+    
         next_roi = data['next_pyramiding_roi']
-
+    
         if roi >= next_roi:
             self.log(f"📈 {symbol} đạt ROI {roi:.2f}% >= ngưỡng {next_roi:.2f}%, tiến hành nhồi lệnh lần {data['pyramiding_count']+1}")
-            success = self._pyramid_order(symbol, data['side'])
+            success, reason = self._pyramid_order(symbol, data['side'])
             if success:
                 data['pyramiding_count'] += 1
                 data['next_pyramiding_roi'] = next_roi + self.pyramiding_x
                 data['last_pyramiding_time'] = time.time()
                 self.log(f"🔄 Nhồi lệnh {symbol} lần {data['pyramiding_count']} thành công tại ROI {roi:.2f}%")
             else:
-                self.log(f"⚠️ Nhồi lệnh {symbol} thất bại, giữ nguyên số lần và ngưỡng")
+                current_time = time.time()
+                if current_time - data.get('last_pyramid_fail_log_time', 0) > 10:
+                    self.log(f"⚠️ Nhồi lệnh {symbol} thất bại: {reason}")
+                    data['last_pyramid_fail_log_time'] = current_time
 
     def _pyramid_order(self, symbol, side):
-        """Đặt lệnh nhồi thêm, trả về True nếu thành công (ĐÃ SỬA LỖI)"""
+        """Đặt lệnh nhồi thêm, trả về (True, None) nếu thành công, (False, reason) nếu thất bại."""
         try:
             total_balance, available_balance = get_total_and_available_balance(self.api_key, self.api_secret)
             if total_balance is None or total_balance <= 0:
                 self.log(f"❌ {symbol} - Không thể lấy tổng số dư để nhồi lệnh")
-                return False
-
+                return False, "Không lấy được tổng số dư"
+    
             usd_amount = total_balance * (self.percent / 100)
-
+    
             if usd_amount > available_balance:
                 self.log(f"⚠️ {symbol} - Nhồi lệnh: {self.percent}% tổng số dư ({usd_amount:.2f}) lớn hơn số dư khả dụng ({available_balance:.2f}), vẫn thử...")
-
+    
             current_price = self._get_fresh_price(symbol)
             if current_price <= 0:
                 self.log(f"❌ {symbol} - Lỗi giá khi nhồi lệnh")
-                return False
-
+                return False, "Giá không hợp lệ"
+    
             if self.enable_balance_orders:
                 buy_threshold = _BALANCE_CONFIG.get("buy_price_threshold", 1.0)
                 sell_threshold = _BALANCE_CONFIG.get("sell_price_threshold", 10.0)
                 if side == "BUY" and current_price >= buy_threshold:
                     self.log(f"⚠️ Không nhồi lệnh {symbol}: giá {current_price:.4f} >= ngưỡng mua {buy_threshold}")
-                    return False
+                    return False, f"Giá >= ngưỡng mua {buy_threshold}"
                 if side == "SELL" and current_price <= sell_threshold:
                     self.log(f"⚠️ Không nhồi lệnh {symbol}: giá {current_price:.4f} <= ngưỡng bán {sell_threshold}")
-                    return False
-
+                    return False, f"Giá <= ngưỡng bán {sell_threshold}"
+    
             step_size = get_step_size(symbol)
             min_qty = get_min_qty_from_cache(symbol)
             min_notional = get_min_notional_from_cache(symbol)
-
+    
             qty = (usd_amount * self.lev) / current_price
             if step_size > 0:
                 qty = math.floor(qty / step_size) * step_size
                 qty = round(qty, 8)
-
+    
             if qty < min_qty:
                 self.log(f"⚠️ Không thể nhồi lệnh {symbol}: khối lượng {qty} < minQty {min_qty}")
-                return False
+                return False, f"Khối lượng {qty} < minQty {min_qty}"
             notional_value = qty * current_price
             if notional_value < min_notional:
                 self.log(f"⚠️ Không thể nhồi lệnh {symbol}: giá trị {notional_value:.2f} < {min_notional} (minNotional)")
-                return False
+                return False, f"Giá trị {notional_value:.2f} < minNotional {min_notional}"
             if qty <= 0:
                 self.log(f"⚠️ Không thể nhồi lệnh {symbol}: khối lượng không hợp lệ")
-                return False
-
+                return False, "Khối lượng không hợp lệ"
+    
             result = place_order(symbol, side, qty, self.api_key, self.api_secret)
-            if result and 'orderId' in result:
-                executed_qty = float(result.get('executedQty', 0))
-                avg_price = float(result.get('avgPrice', current_price))
-
-                if executed_qty < 0:
-                    self.log(f"⚠️ Lệnh nhồi {symbol} không khớp")
-                    return False
-
-                old_qty = self.symbol_data[symbol]['qty']
-                old_entry = self.symbol_data[symbol]['entry']
-
-                new_qty = old_qty + (executed_qty if side == "BUY" else -executed_qty)
-                new_entry = (old_entry * abs(old_qty) + avg_price * executed_qty) / (abs(old_qty) + executed_qty)
-
-                self.symbol_data[symbol].update({
-                    'qty': new_qty,
-                    'entry': new_entry,
-                    'entry_base': new_entry,  # QUAN TRỌNG: cập nhật entry_base để ROI sau tính đúng
-                })
-                self.log(f"➕ Đã nhồi thêm {executed_qty} {symbol} giá {avg_price}")
-                return True
-            else:
+            if not result or 'orderId' not in result:
                 error_msg = result.get('msg', 'Không có phản hồi') if result else 'Không có phản hồi'
                 self.log(f"❌ Lệnh nhồi {symbol} thất bại: {error_msg}")
-                return False
+                return False, f"Lỗi đặt lệnh: {error_msg}"
+    
+            executed_qty = float(result.get('executedQty', 0))
+            avg_price = float(result.get('avgPrice', current_price))
+    
+            if executed_qty < 0:
+                self.log(f"⚠️ Lệnh nhồi {symbol} không khớp")
+                return False, "Lệnh không khớp"
+    
+            old_qty = self.symbol_data[symbol]['qty']
+            old_entry = self.symbol_data[symbol]['entry']
+    
+            new_qty = old_qty + (executed_qty if side == "BUY" else -executed_qty)
+            new_entry = (old_entry * abs(old_qty) + avg_price * executed_qty) / (abs(old_qty) + executed_qty)
+    
+            self.symbol_data[symbol].update({
+                'qty': new_qty,
+                'entry': new_entry,
+                'entry_base': new_entry,
+            })
+            self.log(f"➕ Đã nhồi thêm {executed_qty} {symbol} giá {avg_price}")
+            return True, None
         except Exception as e:
             self.log(f"❌ Lỗi nhồi lệnh {symbol}: {str(e)}")
-            return False
-
+            return False, f"Lỗi ngoại lệ: {str(e)}"
     def _check_smart_exit_condition(self, symbol):
         if not self.roi_trigger:
             return False
