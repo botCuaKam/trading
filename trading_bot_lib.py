@@ -1874,40 +1874,6 @@ class BaseBot:
             return
 
     def _check_pyramiding(self, symbol):
-        """Kiểm tra và thực hiện nhồi lệnh nếu đủ điều kiện (ĐÃ SỬA LỖI)"""
-        if not self.pyramiding_enabled:
-            return
-        if symbol not in self.symbol_data:
-            return
-        data = self.symbol_data[symbol]
-        if not data['position_open']:
-            return
-        if data['pyramiding_count'] >= self.pyramiding_n:
-            return
-
-        # Lấy entry mới nhất từ API (ưu tiên)
-        real_pos = self._force_check_position(symbol)
-        if real_pos:
-            entry = float(real_pos.get('entryPrice', 0))
-            if entry > 0:
-                data['entry'] = entry
-            else:
-                entry = data['entry']  # fallback về entry cũ
-        else:
-            entry = data['entry']
-
-        if entry <= 0:
-            self.log(f"⚠️ {symbol} - entry <= 0, bỏ qua pyramiding")
-            return
-
-        # Lấy giá hiện tại (ưu tiên mark price)
-        current_price = get_mark_price(symbol)
-        if current_price <= 0:
-            current_price = self.get_current_price(symbol)
-        if current_price <= 0:
-            self.log(f"⚠️ {symbol} - không có giá, bỏ qua pyramiding")
-            return
-
         if data['side'] == 'BUY':
             roi = (current_price - entry) / entry * 100 * self.lev
         else:
