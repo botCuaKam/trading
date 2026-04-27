@@ -2015,19 +2015,15 @@ class BaseBot:
                 if side == "BUY":
                     max_price_buy = _BALANCE_CONFIG.get("max_price_buy", float('inf'))
                     max_volume_buy = _BALANCE_CONFIG.get("max_volume_buy", float('inf'))
-                    if current_price > max_price_buy:
+                    if current_price > max_price_buy and coin_volume > max_volume_buy:
                         self.log(f"⚠️ Không nhồi lệnh {symbol}: giá {current_price:.4f} > max_price_buy {max_price_buy}")
-                        return False
-                    if coin_volume > max_volume_buy:
                         self.log(f"⚠️ Không nhồi lệnh {symbol}: volume {coin_volume:.2f} > max_volume_buy {max_volume_buy}")
                         return False
                 else:
                     min_price_sell = _BALANCE_CONFIG.get("min_price_sell", 0.0)
                     min_volume_sell = _BALANCE_CONFIG.get("min_volume_sell", 0.0)
-                    if current_price < min_price_sell:
+                    if current_price < min_price_sell and coin_volume < min_volume_sell:
                         self.log(f"⚠️ Không nhồi lệnh {symbol}: giá {current_price:.4f} < min_price_sell {min_price_sell}")
-                        return False
-                    if coin_volume < min_volume_sell:
                         self.log(f"⚠️ Không nhồi lệnh {symbol}: volume {coin_volume:.2f} < min_volume_sell {min_volume_sell}")
                         return False
 
