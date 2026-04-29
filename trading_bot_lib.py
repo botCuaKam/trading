@@ -1,8 +1,10 @@
-# trading_bot_lib_v4_complete.py
+# trading_bot_final.py
 # =============================================================================
-#  KẾT HỢP: LOGIC XỬ LÝ LỆNH + CACHE & API + LỌC RIÊNG BIỆT MUA/BÁN
+#  HOÀN CHỈNH: LOGIC XỬ LÝ LỆNH + CACHE & API + LỌC RIÊNG BIỆT MUA/BÁN
 #  - MUA: giá ≤ max_price_buy, volume ≤ max_volume_buy
 #  - BÁN: giá ≥ min_price_sell, volume ≥ min_volume_sell
+#  - Blacklist 5 phút sau khi đóng lệnh (TP/SL/Smart Exit)
+#  - Sửa memory leak: cache WebSocket, mark price LRU, symbol locks
 # =============================================================================
 
 import json
@@ -28,6 +30,8 @@ import ssl
 import html
 import sys
 from typing import Optional, List, Dict, Any, Tuple, Callable
+from functools import lru_cache
+import weakref
 
 # ========== CẤU HÌNH & HẰNG SỐ ==========
 _BINANCE_LAST_REQUEST_TIME = 0
@@ -84,12 +88,10 @@ _COINS_CACHE = CoinCache()
 class BalanceConfig:
     def __init__(self):
         self._config = {
-            # Điều kiện MUA
-            "max_price_buy": float('inf'),      # giá ≤ max_price_buy mới được mua
-            "max_volume_buy": float('inf'),     # volume ≤ max_volume_buy mới được mua
-            # Điều kiện BÁN
-            "min_price_sell": 0.0,              # giá ≥ min_price_sell mới được bán
-            "min_volume_sell": 0.0,             # volume ≥ min_volume_sell mới được bán
+            "max_price_buy": float('inf'),
+            "max_volume_buy": float('inf'),
+            "min_price_sell": 0.0,
+            "min_volume_sell": 0.0,
             "min_leverage": 10,
             "sort_by_volume": True,
         }
@@ -840,24 +842,16 @@ def get_current_price(symbol):
         logger.error(f"Lỗi giá {symbol}: {str(e)}")
         return 0
 
+# SỬA LỖI MEMORY LEAK: dùng LRU cache cho mark price
+@lru_cache(maxsize=200)
 def get_mark_price(symbol):
     if not symbol:
         return 0
-    cache_key = f"mark_{symbol}"
-    now = time.time()
-    if hasattr(get_mark_price, 'cache') and cache_key in get_mark_price.cache:
-        price, ts = get_mark_price.cache[cache_key]
-        if now - ts < 2:
-            return price
     try:
         url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol.upper()}"
         data = binance_api_request(url)
         if data and 'markPrice' in data:
-            price = float(data['markPrice'])
-            if not hasattr(get_mark_price, 'cache'):
-                get_mark_price.cache = {}
-            get_mark_price.cache[cache_key] = (price, now)
-            return price
+            return float(data['markPrice'])
     except Exception as e:
         logger.error(f"Lỗi lấy mark price {symbol}: {e}")
     return get_current_price(symbol)
@@ -1190,7 +1184,7 @@ class SmartCoinFinder:
             logger.error(traceback.format_exc())
             return None
 
-# ========== WEBSOCKET MANAGER ==========
+# ========== WEBSOCKET MANAGER (SỬA MEMORY LEAK) ==========
 class WebSocketManager:
     def __init__(self):
         self.connections = {}
@@ -1216,14 +1210,14 @@ class WebSocketManager:
             try:
                 data = json.loads(message)
                 if 'data' in data:
-                    symbol = data['data']['s']
+                    sym = data['data']['s']
                     price = float(data['data']['p'])
                     current_time = time.time()
-                    if (symbol in self.last_price_update and
-                        current_time - self.last_price_update[symbol] < 0.1):
+                    if (sym in self.last_price_update and
+                        current_time - self.last_price_update[sym] < 0.1):
                         return
-                    self.last_price_update[symbol] = current_time
-                    self.price_cache[symbol] = price
+                    self.last_price_update[sym] = current_time
+                    self.price_cache[sym] = price
                     self.executor.submit(callback, price)
             except Exception as e:
                 logger.error(f"Lỗi tin nhắn WebSocket {symbol}: {str(e)}")
@@ -1262,6 +1256,9 @@ class WebSocketManager:
                     logger.error(f"Lỗi đóng WebSocket {symbol}: {str(e)}")
                 self.connections[symbol]['callback'] = None
                 del self.connections[symbol]
+                # Xóa cache giá để tránh memory leak
+                self.price_cache.pop(symbol, None)
+                self.last_price_update.pop(symbol, None)
                 logger.info(f"WebSocket đã xóa cho {symbol}")
 
     def stop(self):
@@ -1270,7 +1267,7 @@ class WebSocketManager:
             self.remove_symbol(symbol)
         self.executor.shutdown(wait=False)
 
-# ========== LỚP BOT CỐT LÕI (BaseBot) - ĐẦY ĐỦ ==========
+# ========== LỚP BOT CỐT LÕI (BaseBot) ==========
 class BaseBot:
     def __init__(self, symbol, lev, percent, tp, sl, roi_trigger, ws_manager, api_key, api_secret,
                  telegram_bot_token, telegram_chat_id, strategy_name, config_key=None, bot_id=None,
@@ -1668,7 +1665,6 @@ class BaseBot:
                     self.stop_symbol(symbol, failed=True)
                     return False
 
-                # Lấy volume hiện tại từ cache
                 coin_volume = 0
                 coins = get_coins_with_info()
                 for c in coins:
@@ -1684,10 +1680,12 @@ class BaseBot:
                             self.log(f"⚠️ {symbol} - Cả giá và volume đều không đạt điều kiện BUY")
                             self.stop_symbol(symbol, failed=True)
                             return False
-                    else:  # SELL
+                    else:
                         min_price_sell = _BALANCE_CONFIG.get("min_price_sell", 0.0)
                         min_volume_sell = _BALANCE_CONFIG.get("min_volume_sell", 0.0)
                         if current_price < min_price_sell and coin_volume < min_volume_sell:
+                            self.log(f"⚠️ {symbol} - Cả giá và volume đều không đạt điều kiện SELL")
+                            self.stop_symbol(symbol, failed=True)
                             return False
 
                 step_size = get_step_size(symbol)
@@ -1847,47 +1845,14 @@ class BaseBot:
                 self.log(f"❌ Lỗi đóng vị thế {symbol}: {str(e)}")
                 return False
 
-    def stop_symbol(self, symbol, failed=False):
+    # THÊM METHOD BLACKLIST SAU KHI ĐÓNG LỆNH
+    def _blacklist_and_stop_symbol(self, symbol, reason=""):
+        """Đưa symbol vào blacklist tạm thời 5 phút và dừng theo dõi"""
         if symbol not in self.active_symbols:
-            return False
-        self.log(f"⛔ Đang dừng coin {symbol}...{' (lỗi)' if failed else ''}")
-        if self.symbol_data[symbol]['position_open']:
-            self._close_symbol_position(symbol, reason="(Stop by user)")
-        self.ws_manager.remove_symbol(symbol)
-        self.active_symbols.remove(symbol)
-        self.coin_manager.unregister_coin(symbol)
-
-        if failed:
-            if hasattr(self, '_bot_manager') and self._bot_manager:
-                self._bot_manager.bot_coordinator.release_coin(symbol)
-                self._bot_manager.bot_coordinator.add_temp_blacklist(symbol, duration=1800)
-            self.consecutive_failures += 1
-            cooldown = min(60, 5 * self.consecutive_failures)
-            self.failure_cooldown_until = time.time() + cooldown
-            self.log(f"⏳ Thất bại lần {self.consecutive_failures}, nghỉ {cooldown}s trước khi tìm coin mới")
-        else:
-            self.consecutive_failures = 0
-
-        if not self.active_symbols:
-            self.bot_coordinator.bot_lost_coin(self.bot_id)
-            self.bot_coordinator.finish_coin_search(self.bot_id)
-            self.status = "searching"
-        self.log(f"✅ Đã dừng coin {symbol}")
-        return True
-
-    def _check_margin_safety(self):
-        try:
-            margin_balance, maint_margin, ratio = get_margin_safety_info(self.api_key, self.api_secret)
-            if ratio is not None and ratio < self.margin_safety_threshold:
-                self.log(f"🚫 CẢNH BÁO AN TOÀN KÝ QUỸ: tỷ lệ {ratio:.2f}x < {self.margin_safety_threshold}x")
-                self.log("⛔ Đóng tất cả vị thế do margin thấp")
-                for symbol in self.active_symbols.copy():
-                    self._close_symbol_position(symbol, reason="(Margin safety)")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"Lỗi kiểm tra margin safety: {str(e)}")
-            return False
+            return
+        self.bot_coordinator.add_temp_blacklist(symbol, duration=300)  # 5 phút
+        self.log(f"⛔ {symbol} đã bị blacklist 5 phút do {reason}")
+        self.stop_symbol(symbol, failed=False)
 
     def _check_symbol_tp_sl(self, symbol):
         if symbol not in self.symbol_data:
@@ -1928,11 +1893,13 @@ class BaseBot:
 
         if self.tp and roi >= self.tp:
             self.log(f"🎯 {symbol} - Đạt TP {self.tp}%, đóng lệnh")
-            self._close_symbol_position(symbol, reason=f"(TP {self.tp}%)")
+            if self._close_symbol_position(symbol, reason=f"(TP {self.tp}%)"):
+                self._blacklist_and_stop_symbol(symbol, reason="TP")
             return
         if self.sl and roi <= -self.sl:
             self.log(f"🛡️ {symbol} - Đạt SL {self.sl}%, đóng lệnh")
-            self._close_symbol_position(symbol, reason=f"(SL {self.sl}%)")
+            if self._close_symbol_position(symbol, reason=f"(SL {self.sl}%)"):
+                self._blacklist_and_stop_symbol(symbol, reason="SL")
             return
 
     def _check_pyramiding(self, symbol):
@@ -2004,7 +1971,6 @@ class BaseBot:
                 self.log(f"❌ {symbol} - Lỗi giá khi nhồi lệnh")
                 return False
 
-            # Kiểm tra điều kiện lọc khi nhồi
             if self.enable_balance_orders:
                 coin_volume = 0
                 coins = get_coins_with_info()
@@ -2114,9 +2080,25 @@ class BaseBot:
             self.log(f"🎯 ROI đạt {roi:.2f}% - Kích hoạt chốt lời sớm")
 
         if data['roi_check_activated'] and roi < data['high_water_mark_roi'] * 0.9:
-            self._close_symbol_position(symbol, reason=f"(Smart exit - ROI từ {data['high_water_mark_roi']:.2f}% giảm còn {roi:.2f}%)")
+            if self._close_symbol_position(symbol, reason=f"(Smart exit - ROI từ {data['high_water_mark_roi']:.2f}% giảm còn {roi:.2f}%)"):
+                self._blacklist_and_stop_symbol(symbol, reason="Smart exit")
             return True
         return False
+
+    def _check_margin_safety(self):
+        try:
+            margin_balance, maint_margin, ratio = get_margin_safety_info(self.api_key, self.api_secret)
+            if ratio is not None and ratio < self.margin_safety_threshold:
+                self.log(f"🚫 CẢNH BÁO AN TOÀN KÝ QUỸ: tỷ lệ {ratio:.2f}x < {self.margin_safety_threshold}x")
+                self.log("⛔ Đóng tất cả vị thế do margin thấp")
+                for symbol in self.active_symbols.copy():
+                    if self._close_symbol_position(symbol, reason="(Margin safety)"):
+                        self._blacklist_and_stop_symbol(symbol, reason="Margin safety")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Lỗi kiểm tra margin safety: {str(e)}")
+            return False
 
     def check_global_positions(self):
         if hasattr(self, '_bot_manager') and self._bot_manager and hasattr(self._bot_manager, 'global_side_coordinator'):
@@ -2142,6 +2124,34 @@ class BaseBot:
                 return "BUY"
             else:
                 return random.choice(["BUY", "SELL"])
+
+    def stop_symbol(self, symbol, failed=False):
+        if symbol not in self.active_symbols:
+            return False
+        self.log(f"⛔ Đang dừng coin {symbol}...{' (lỗi)' if failed else ''}")
+        if self.symbol_data[symbol]['position_open']:
+            self._close_symbol_position(symbol, reason="(Stop by user)")
+        self.ws_manager.remove_symbol(symbol)
+        self.active_symbols.remove(symbol)
+        self.coin_manager.unregister_coin(symbol)
+
+        if failed:
+            if hasattr(self, '_bot_manager') and self._bot_manager:
+                self._bot_manager.bot_coordinator.release_coin(symbol)
+                self._bot_manager.bot_coordinator.add_temp_blacklist(symbol, duration=1800)
+            self.consecutive_failures += 1
+            cooldown = min(60, 5 * self.consecutive_failures)
+            self.failure_cooldown_until = time.time() + cooldown
+            self.log(f"⏳ Thất bại lần {self.consecutive_failures}, nghỉ {cooldown}s trước khi tìm coin mới")
+        else:
+            self.consecutive_failures = 0
+
+        if not self.active_symbols:
+            self.bot_coordinator.bot_lost_coin(self.bot_id)
+            self.bot_coordinator.finish_coin_search(self.bot_id)
+            self.status = "searching"
+        self.log(f"✅ Đã dừng coin {symbol}")
+        return True
 
     def stop_all_symbols(self):
         count = 0
@@ -2169,7 +2179,7 @@ class BaseBot:
 class GlobalMarketBot(BaseBot):
     pass
 
-# ========== BotManager (ĐẦY ĐỦ) ==========
+# ========== BotManager ==========
 class BotManager:
     def __init__(self, api_key=None, api_secret=None, telegram_bot_token=None, telegram_chat_id=None):
         self.ws_manager = WebSocketManager()
@@ -2572,6 +2582,7 @@ class BotManager:
         except Exception as e:
             logger.error(f"Lỗi xử lý tin nhắn Telegram: {str(e)}")
 
+    
     def _process_telegram_command(self, chat_id, text):
         user_state = self.user_states.get(chat_id, {})
         current_step = user_state.get('step')
