@@ -1,4 +1,4 @@
-# trading_bot_final.py
+# trading_bot_lib_fixed.py
 # =============================================================================
 #  HOÀN CHỈNH: LOGIC XỬ LÝ LỆNH + CACHE & API + LỌC RIÊNG BIỆT MUA/BÁN
 #  - MUA: giá ≤ max_price_buy, volume ≤ max_volume_buy
@@ -6,6 +6,7 @@
 #  - Blacklist 5 phút sau khi đóng lệnh (TP/SL/Smart Exit)
 #  - Sửa memory leak: cache WebSocket, mark price LRU, symbol locks
 #  - Bổ sung: Hướng coin riêng dựa trên nến (tỉ lệ tùy chỉnh)
+#  - SỬA LỖI KẸT COIN: stop_symbol luôn xóa coin khỏi active_symbols dù có lỗi
 # =============================================================================
 
 import json
@@ -1173,7 +1174,7 @@ class SmartCoinFinder:
 
                 if local_side != global_side:
                     if self._bot_manager:
-                        self._bot_manager.bot_coordinator.add_temp_blacklist(symbol, duration=60)  # <<<< ĐÃ THÊM BLACKLIST
+                        self._bot_manager.bot_coordinator.add_temp_blacklist(symbol, duration=60)
                     logger.info(f"⏭️ {symbol} có local side {local_side} khác global {global_side}, blacklist 60s")
                     continue
 
@@ -1510,7 +1511,8 @@ class BaseBot:
             'last_pyramiding_time': 0,
             'pyramiding_base_roi': 0.0,
             'high_water_mark_roi': 0,
-            'roi_check_activated': False
+            'roi_check_activated': False,
+            'failed_attempts': 0   # <-- THÊM BIẾN ĐẾM THẤT BẠI
         }
         self.ws_manager.add_symbol(symbol, lambda p, s=symbol: self._handle_price_update(s, p))
         self.coin_manager.register_coin(symbol)
@@ -1572,16 +1574,14 @@ class BaseBot:
                         })
                         self.log(f"📌 Phát hiện vị thế {symbol} từ API")
                 else:
-                    # Vị thế đã đóng (positionAmt = 0) nhưng bot tưởng đang mở
                     if self.symbol_data[symbol]['position_open']:
                         self.log(f"🔔 Phát hiện {symbol} vị thế đã đóng (có thể do người dùng đóng) - blacklist 5 phút")
-                        self.bot_coordinator.add_temp_blacklist(symbol, duration=300)  # <<<< ĐÃ THÊM
+                        self.bot_coordinator.add_temp_blacklist(symbol, duration=300)
                     self._reset_symbol_position(symbol)
             else:
-                # Không có vị thế nào trả về
                 if self.symbol_data[symbol]['position_open']:
                     self.log(f"🔔 Không còn vị thế {symbol} - blacklist 5 phút")
-                    self.bot_coordinator.add_temp_blacklist(symbol, duration=300)  # <<<< ĐÃ THÊM
+                    self.bot_coordinator.add_temp_blacklist(symbol, duration=300)
                 self._reset_symbol_position(symbol)
         except Exception as e:
             logger.error(f"Lỗi kiểm tra vị thế {symbol}: {str(e)}")
@@ -1616,7 +1616,8 @@ class BaseBot:
                 local_check = get_local_side_from_candles(symbol, self.candle_ratio)
                 if local_check is None or local_check != side:
                     self.log(f"⚠️ {symbol} tín hiệu nến không còn phù hợp ({local_check} vs {side})")
-                    self._bot_manager.bot_coordinator.add_temp_blacklist(symbol, duration=60)
+                    if hasattr(self, '_bot_manager') and self._bot_manager:
+                        self._bot_manager.bot_coordinator.add_temp_blacklist(symbol, duration=60)
                     self.stop_symbol(symbol, failed=True)
                     return False
 
@@ -2071,20 +2072,41 @@ class BaseBot:
             else:
                 return random.choice(["BUY", "SELL"])
 
+    # ===================== SỬA LỖI KẸT COIN =====================
     def stop_symbol(self, symbol, failed=False):
         if symbol not in self.active_symbols:
             return False
+
         self.log(f"⛔ Đang dừng coin {symbol}...{' (lỗi)' if failed else ''}")
-        if self.symbol_data[symbol]['position_open']:
-            self._close_symbol_position(symbol, reason="(Stop by user)")
-        self.ws_manager.remove_symbol(symbol)
-        self.active_symbols.remove(symbol)
+
+        # Đóng vị thế nếu đang mở
+        if self.symbol_data.get(symbol, {}).get('position_open'):
+            try:
+                self._close_symbol_position(symbol, reason="(Stop by user)")
+            except Exception as e:
+                self.log(f"❌ Lỗi đóng vị thế khi dừng {symbol}: {str(e)}")
+
+        # Luôn cố gắng dừng WebSocket
+        try:
+            self.ws_manager.remove_symbol(symbol)
+        except Exception as e:
+            self.log(f"❌ Lỗi dừng WebSocket {symbol}: {str(e)}")
+
+        # Luôn đảm bảo xoá khỏi danh sách active_symbols
+        try:
+            self.active_symbols.remove(symbol)
+        except ValueError:
+            self.log(f"⚠️ {symbol} không có trong active_symbols khi dừng")
+
         self.coin_manager.unregister_coin(symbol)
 
         if failed:
             if hasattr(self, '_bot_manager') and self._bot_manager:
-                self._bot_manager.bot_coordinator.release_coin(symbol)
-                self._bot_manager.bot_coordinator.add_temp_blacklist(symbol, duration=1800)
+                try:
+                    self._bot_manager.bot_coordinator.release_coin(symbol)
+                    self._bot_manager.bot_coordinator.add_temp_blacklist(symbol, duration=1800)
+                except Exception as e:
+                    self.log(f"❌ Lỗi release/blacklist {symbol}: {str(e)}")
             self.consecutive_failures += 1
             cooldown = min(60, 5 * self.consecutive_failures)
             self.failure_cooldown_until = time.time() + cooldown
@@ -2096,6 +2118,8 @@ class BaseBot:
             self.bot_coordinator.bot_lost_coin(self.bot_id)
             self.bot_coordinator.finish_coin_search(self.bot_id)
             self.status = "searching"
+            self.log("🔍 Chuyển sang trạng thái tìm coin mới")
+
         self.log(f"✅ Đã dừng coin {symbol}")
         return True
 
