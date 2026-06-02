@@ -264,8 +264,9 @@ def create_strategy_config_keyboard():
         "keyboard": [
             [{"text": "📊 Xem tham số chiến lược"}],
             [{"text": "✏️ 1m/15m volume factor"}, {"text": "✏️ Current/closed volume factor"}],
-            [{"text": "✏️ Min elapsed seconds"}, {"text": "✏️ Breakout lookback"}],
-            [{"text": "✏️ Body ratio min"}, {"text": "✏️ Close position"}],
+            [{"text": "✏️ Min elapsed seconds"}, {"text": "✏️ Body ratio min"}],
+            [{"text": "✏️ Min current body factor"}, {"text": "✏️ Max chase body factor"}],
+            [{"text": "✏️ Breakout lookback"}],
             [{"text": "✏️ Reverse capital multiplier"}, {"text": "✏️ Max reverse balance %"}],
             [{"text": "✏️ Max reverse count"}],
             [{"text": "🔄 Reset chiến lược"}],
@@ -277,9 +278,10 @@ def create_strategy_config_keyboard():
 def create_strategy_value_keyboard():
     return {
         "keyboard": [
+            [{"text": "0"}, {"text": "3"}, {"text": "5"}],
             [{"text": "0.10"}, {"text": "0.15"}, {"text": "0.20"}],
             [{"text": "1.00"}, {"text": "1.10"}, {"text": "1.20"}, {"text": "1.50"}],
-            [{"text": "1"}, {"text": "2"}],
+            [{"text": "1"}, {"text": "2"}, {"text": "3"}],
             [{"text": "❌ Hủy bỏ"}]
         ],
         "resize_keyboard": True, "one_time_keyboard": True
@@ -823,8 +825,15 @@ class StrategyConfig:
         'min_elapsed_seconds': 6.0,
         'closed_1m_vs_15m_factor': 1.5,
         'current_1m_vs_closed_factor': 1.2,
+        # Phá high/low ngắn hạn: raw BUY phải phá high, raw SELL phải phá low; sau đó tín hiệu được đảo chiều.
         'breakout_lookback': 5,
-        'body_ratio_min': 0.50,
+        # Tránh doji: thân nến hiện tại phải đủ rõ so với biên độ nến.
+        'body_ratio_min': 0.30,
+        # Tránh sideway nhẹ: thân nến hiện tại phải lớn tối thiểu so với thân nến 1m vừa đóng.
+        'min_current_body_factor': 0.30,
+        # Chống đu giá: thân nến hiện tại không được quá lớn so với thân nến 1m vừa đóng.
+        'max_chase_body_factor': 3.00,
+        # Giữ lại key cũ để tương thích file/Telegram cũ, nhưng chiến lược mới không dùng close_position.
         'close_position_buy': 0.65,
         'close_position_sell': 0.35,
         'reverse_capital_multiplier': 1.3,
@@ -876,19 +885,21 @@ _STRATEGY_CONFIG = StrategyConfig()
 def get_strategy_config_text():
     c = _STRATEGY_CONFIG.get_all()
     return (
-        "🎯 <b>THAM SỐ CHIẾN LƯỢC 1M/15M SPEED</b>\n\n"
+        "🎯 <b>THAM SỐ CHIẾN LƯỢC 1M/15M SPEED - ĐẢO HƯỚNG</b>\n\n"
         f"• 1m/15m volume factor: {c['closed_1m_vs_15m_factor']:.2f}\n"
         f"• Current/closed volume factor: {c['current_1m_vs_closed_factor']:.2f}\n"
         f"• Min elapsed seconds: {c['min_elapsed_seconds']:.1f}s\n"
-        f"• Breakout lookback: {int(c['breakout_lookback'])} nến 1m\n"
-        f"• Body ratio min: {c['body_ratio_min']:.2f}\n"
-        f"• Close position BUY/SELL: {c['close_position_buy']:.2f} / {c['close_position_sell']:.2f}\n\n"
+        f"• Body ratio min tránh doji: {c['body_ratio_min']:.2f}\n"
+        f"• Min current body factor tránh sideway: {c['min_current_body_factor']:.2f}\n"
+        f"• Max chase body factor chống đu giá: {c['max_chase_body_factor']:.2f}\n"
+        f"• Breakout high/low lookback: {int(c['breakout_lookback'])} nến 1m\n\n"
         "💰 <b>QUẢN LÝ VỐN ĐẢO CHIỀU</b>\n"
         f"• Reverse capital multiplier: {c['reverse_capital_multiplier']:.2f}\n"
         f"• Max reverse balance %: {c['max_reverse_balance_percent']:.1f}%\n"
         f"• Max reverse count: {int(c['max_reverse_count'])}\n\n"
         "Luồng tín hiệu: 1m đã đóng > tốc độ TB 15m, sau đó 1m hiện tại sau min seconds > 1m đã đóng, "
-        "rồi mới lấy hướng nến hiện tại và lọc sideway bằng vùng 1m ngắn hạn. Mở và đảo chiều dùng cùng một tín hiệu."
+        "lọc doji/sideway bằng thân nến, chống đu giá bằng max body, kiểm tra raw candle phá high/low ngắn hạn, rồi ĐẢO NGƯỢC hướng đó. "
+        "Ví dụ nến xanh phá high đủ chuẩn => SELL, nến đỏ phá low đủ chuẩn => BUY. Mở và đảo chiều dùng cùng một tín hiệu đảo."
     )
 
 def _candle_direction(open_price, close_price):
@@ -896,6 +907,13 @@ def _candle_direction(open_price, close_price):
         return "BUY"
     if close_price < open_price:
         return "SELL"
+    return None
+
+def _opposite_side(side):
+    if side == "BUY":
+        return "SELL"
+    if side == "SELL":
+        return "BUY"
     return None
 
 def _safe_progress(candle, timeframe_seconds=None):
@@ -951,9 +969,13 @@ def _score_signal_parts(open_curr, current_price, high_curr, low_curr, volume_cu
         if current_ratio < float(cfg['current_1m_vs_closed_factor']):
             return None, 0, f'current_1m_slow ratio={current_ratio:.2f} need={cfg["current_1m_vs_closed_factor"]:.2f}', False
 
-        side = _candle_direction(float(open_curr), float(current_price))
-        if not side:
+        raw_side = _candle_direction(float(open_curr), float(current_price))
+        if not raw_side:
             return None, 0, 'flat_current', False
+
+        # Chế độ đảo tín hiệu: nến hiện tại xanh mạnh => SELL, nến hiện tại đỏ mạnh => BUY.
+        # Lý do: tín hiệu tốc độ/volume mạnh hiện tại đang được dùng như dấu hiệu quá đà ngắn hạn.
+        side = _opposite_side(raw_side)
 
         candle_range = max(float(high_curr) - float(low_curr), 0.0)
         if candle_range <= 0:
@@ -964,28 +986,46 @@ def _score_signal_parts(open_curr, current_price, high_curr, low_curr, volume_cu
         if body_ratio < float(cfg['body_ratio_min']):
             return None, 0, f'body_ratio_low {body_ratio:.2f}', False
 
-        close_position = (float(current_price) - float(low_curr)) / candle_range
-        if side == 'BUY' and close_position < float(cfg['close_position_buy']):
-            return None, 0, f'close_position_buy_low {close_position:.2f}', False
-        if side == 'SELL' and close_position > float(cfg['close_position_sell']):
-            return None, 0, f'close_position_sell_high {close_position:.2f}', False
+        # Tránh sideway nhẹ: volume tăng nhưng giá gần như đứng im thì không vào.
+        if prev1_body <= 0:
+            return None, 0, 'prev1_body_zero', False
 
-        history = recent_1m_history or []
-        lookback = int(cfg['breakout_lookback'])
-        if lookback > 0 and len(history) >= max(1, lookback):
+        min_body_need = prev1_body * float(cfg.get('min_current_body_factor', 0.30))
+        if body0 < min_body_need:
+            return None, 0, f'current_body_too_small body0={body0:.8f} need={min_body_need:.8f}', False
+
+        # Chống đu đỉnh/bán đáy: nến hiện tại đã chạy quá xa so với nến 1m vừa đóng thì bỏ qua.
+        max_body_allow = prev1_body * float(cfg.get('max_chase_body_factor', 3.00))
+        if body0 > max_body_allow:
+            return None, 0, f'current_body_too_large body0={body0:.8f} max={max_body_allow:.8f}', False
+
+        # Phá high/low ngắn hạn theo hướng gốc của nến hiện tại, rồi tín hiệu cuối cùng sẽ đảo ngược.
+        # raw BUY phá high => SELL; raw SELL phá low => BUY.
+        lookback = int(cfg.get('breakout_lookback', 5) or 0)
+        breakout_info = 'breakout_off'
+        if lookback > 0:
+            history = list(recent_1m_history or [])
+            if len(history) < lookback:
+                return None, 0, f'not_enough_breakout_history have={len(history)} need={lookback}', False
             recent = history[-lookback:]
-            highest = max(_candle_get(c, 'high', 2) for c in recent)
-            lowest = min(_candle_get(c, 'low', 3) for c in recent)
-            if side == 'BUY' and float(current_price) <= highest:
-                return None, 0, f'no_1m_breakout_buy price={float(current_price):.8f} high{lookback}={highest:.8f}', False
-            if side == 'SELL' and float(current_price) >= lowest:
-                return None, 0, f'no_1m_breakout_sell price={float(current_price):.8f} low{lookback}={lowest:.8f}', False
+            highest_high = max(_candle_get(c, 'high', 2) for c in recent)
+            lowest_low = min(_candle_get(c, 'low', 3) for c in recent)
+            if raw_side == 'BUY':
+                if float(current_price) <= highest_high:
+                    return None, 0, f'raw_buy_not_break_high price={float(current_price):.8f} high{lookback}={highest_high:.8f}', False
+                breakout_info = f'raw_BUY_break_high{lookback}={highest_high:.8f}'
+            elif raw_side == 'SELL':
+                if float(current_price) >= lowest_low:
+                    return None, 0, f'raw_sell_not_break_low price={float(current_price):.8f} low{lookback}={lowest_low:.8f}', False
+                breakout_info = f'raw_SELL_break_low{lookback}={lowest_low:.8f}'
 
         reason = (
-            f'1m15m_speed+current_speed+sideway_ok | elapsed={elapsed:.1f}s '
+            f'1m15m_speed_REVERSED+current_speed+doji_sideway_highlow_ok | elapsed={elapsed:.1f}s '
+            f'raw_side={raw_side} reversed_signal={side} {breakout_info} '
             f'closed_ratio={closed_ratio:.2f} current_ratio={current_ratio:.2f} '
             f'projected_vol0={projected_vol0:.4f} vol1m={prev1_vol:.4f} avg15m_per_min={avg_vol_15_per_min:.4f} '
-            f'body_ratio={body_ratio:.2f} close_pos={close_position:.2f} prev1_body={prev1_body:.8f}'
+            f'body_ratio={body_ratio:.2f} body0={body0:.8f} prev1_body={prev1_body:.8f} '
+            f'min_body={min_body_need:.8f} max_body={max_body_allow:.8f}'
         )
         return side, 1, reason, False
     except Exception as e:
@@ -1619,7 +1659,7 @@ class BaseBot:
 
         tp_sl_info = f" | TP: {self.tp}%" if self.tp else " | TP: Tắt"
         tp_sl_info += f" | SL: {self.sl}%" if self.sl else " | SL: Tắt"
-        self.log(f"🟢 Bot {strategy_name} đã khởi động | 1 coin | Đòn bẩy: {lev}x | Vốn: {percent}% | Tín hiệu: Speed-only 1h realtime (volume speed + body speed) | Đảo chiều khi tín hiệu ngược đủ chuẩn{tp_sl_info}")
+        self.log(f"🟢 Bot {strategy_name} đã khởi động | 1 coin | Đòn bẩy: {lev}x | Vốn: {percent}% | Tín hiệu: 1m/15m speed + doji/sideway filter | Đảo chiều khi tín hiệu ngược đủ chuẩn{tp_sl_info}")
 
     def _run(self):
         last_coin_search_log = 0
@@ -2724,9 +2764,10 @@ class BotManager:
             '✏️ 1m/15m volume factor': ('closed_1m_vs_15m_factor', 'Nến 1m đã đóng phải lớn hơn (volume nến 15m đã đóng / 15) * hệ số. Ví dụ 1.5, 2.0, 3.0'),
             '✏️ Current/closed volume factor': ('current_1m_vs_closed_factor', 'Nến 1m hiện tại dự phóng phải lớn hơn volume nến 1m đã đóng * hệ số. Ví dụ 1.2, 1.5, 2.0'),
             '✏️ Min elapsed seconds': ('min_elapsed_seconds', 'Số giây tối thiểu của nến 1m hiện tại trước khi xét. Theo yêu cầu hiện tại nên để 6.'),
-            '✏️ Breakout lookback': ('breakout_lookback', 'Số nến 1m đã đóng dùng để lọc sideway. BUY phá high, SELL phá low. Ví dụ 3 hoặc 5; nhập 0 để tắt.'),
-            '✏️ Body ratio min': ('body_ratio_min', 'Thân nến hiện tại / biên độ nến hiện tại tối thiểu. Ví dụ 0.4, 0.5, 0.6'),
-            '✏️ Close position': ('close_position_buy', 'Nhập 1 số cho close_position BUY; SELL sẽ tự đặt = 1 - số đó. Ví dụ 0.65 nghĩa là BUY gần đỉnh, SELL gần đáy.'),
+            '✏️ Body ratio min': ('body_ratio_min', 'Tránh doji: thân nến hiện tại / biên độ nến hiện tại tối thiểu. Ví dụ 0.25, 0.30, 0.40'),
+            '✏️ Min current body factor': ('min_current_body_factor', 'Tránh sideway: thân nến hiện tại phải >= thân nến 1m vừa đóng * hệ số. Ví dụ 0.2, 0.3, 0.5'),
+            '✏️ Max chase body factor': ('max_chase_body_factor', 'Chống đu giá: thân nến hiện tại không được > thân nến 1m vừa đóng * hệ số. Mặc định 3.0'),
+            '✏️ Breakout lookback': ('breakout_lookback', 'Phá high/low ngắn hạn bằng số nến 1m đã đóng gần nhất. 0=tắt, 3=nhạy, 5=chặt hơn. Với chế độ đảo: nến xanh phá high => SELL, nến đỏ phá low => BUY.'),
             '✏️ Reverse capital multiplier': ('reverse_capital_multiplier', 'Lệnh đảo chiều = vốn lệnh vừa đóng * hệ số. Ví dụ 1.1, 1.3, 1.5'),
             '✏️ Max reverse balance %': ('max_reverse_balance_percent', 'Giới hạn vốn đảo chiều tối đa theo số dư khả dụng. Ví dụ 70, 80, 90'),
             '✏️ Max reverse count': ('max_reverse_count', 'Số lần đảo chiều liên tiếp tối đa trước khi dừng coin để tránh sideway. Ví dụ 1, 2, 3'),
@@ -2849,6 +2890,12 @@ class BotManager:
                         raise ValueError
                 elif key in ('body_ratio_min', 'close_position_buy'):
                     if not (0 < val < 1):
+                        raise ValueError
+                elif key == 'min_current_body_factor':
+                    if not (0 < val <= 5):
+                        raise ValueError
+                elif key == 'max_chase_body_factor':
+                    if not (0 < val <= 20):
                         raise ValueError
                 elif key == 'max_reverse_balance_percent':
                     if not (0 < val <= 100):
@@ -3030,7 +3077,7 @@ class BotManager:
             if success:
                 success_msg = (
                     f"✅ <b>ĐÃ TẠO BOT 1M/15M SPEED THÀNH CÔNG</b>\n\n"
-                    f"🤖 Chiến lược: 1m/15m speed = 1m đóng so với 15m, 1m hiện tại so với 1m đóng\n"
+                    f"🤖 Chiến lược: 1m/15m speed đảo hướng + phá high/low ngắn hạn\n"
                     f"🔧 Chế độ: {bot_mode}\n"
                     f"🔢 Số bot: {bot_count}\n"
                     f"💰 Đòn bẩy: {leverage}x\n"
