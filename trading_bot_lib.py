@@ -233,8 +233,8 @@ def create_strategy_config_keyboard():
             [{"text": "✏️ Signal timeframe"}, {"text": "✏️ Min elapsed seconds"}],
             [{"text": "✏️ Body ratio min"}, {"text": "✏️ Speed edge tolerance"}],
             [{"text": "✏️ Current vs low"}, {"text": "✏️ Strong decline factor"}],
-            [{"text": "✏️ Current vs recent"}, {"text": "✏️ Choppy pattern"}],
-            [{"text": "✏️ Peak pullback"}, {"text": "✏️ Low volume filter"}],
+            [{"text": "✏️ Current vs recent"}, {"text": "✏️ Speed mid factor"}],
+            [{"text": "✏️ Speed peak upper"}, {"text": "✏️ Low volume filter"}],
             [{"text": "✏️ Min 24h volume"}],
             [{"text": "✏️ Profit protect ON/OFF"}, {"text": "✏️ Profit start ROI"}],
             [{"text": "✏️ Profit pullback ROI"}],
@@ -256,6 +256,7 @@ def create_strategy_value_keyboard():
             [{"text": "0"}, {"text": "0.05"}, {"text": "0.10"}],
             [{"text": "0.20"}, {"text": "0.25"}, {"text": "0.30"}],
             [{"text": "1"}, {"text": "1.10"}, {"text": "1.20"}],
+            [{"text": "1.50"}, {"text": "2.00"}, {"text": "3.00"}],
             [{"text": "1m"}, {"text": "3m"}, {"text": "5m"}, {"text": "15m"}],
             [{"text": "❌ Hủy bỏ"}]
         ],
@@ -668,6 +669,8 @@ class StrategyConfig:
         'current_vs_low_factor': 1.20,
         'strong_decline_factor': 2.00,
         'current_vs_recent_factor': 1.00,
+        'speed_mid_factor': 1.00,
+        'speed_peak_upper_factor': 1.00,
         'choppy_pattern_enabled': 1.0,
         'peak_pullback_enabled': 1.0,
         'low_volume_filter_enabled': 1.0,
@@ -718,7 +721,7 @@ def get_strategy_config_text():
     c = _STRATEGY_CONFIG.get_all()
     signal_interval = _normalize_interval(c.get('signal_interval', '1m'))
     return (
-        "🎯 <b>THAM SỐ CHIẾN LƯỢC SPEED PATTERN 5+1</b>\n\n"
+        "🎯 <b>THAM SỐ CHIẾN LƯỢC PEAK/VALLEY SPEED 5+1</b>\n\n"
         f"• Signal timeframe: {signal_interval} ({_interval_seconds(signal_interval):.0f}s)\n"
         f"• Min elapsed seconds: {c['min_elapsed_seconds']:.1f}s\n"
         f"• Body ratio min: {c['body_ratio_min']:.2f}\n"
@@ -726,21 +729,23 @@ def get_strategy_config_text():
         f"• Current vs low factor: {c['current_vs_low_factor']:.2f}x\n"
         f"• Strong decline factor: {c['strong_decline_factor']:.2f}x\n"
         f"• Current vs recent factor: {c['current_vs_recent_factor']:.2f}x\n"
-        f"• Peak pullback: {'ON' if c.get('peak_pullback_enabled', 1.0) >= 0.5 else 'OFF'}\n"
-        f"• Choppy pattern: {'ON' if c.get('choppy_pattern_enabled', 1.0) >= 0.5 else 'OFF'}\n"
+        f"• Speed mid factor: {c.get('speed_mid_factor', 1.0):.2f}x\n"
+        f"• Speed peak upper factor: {c.get('speed_peak_upper_factor', 1.0):.2f}x\n"
         f"• Low volume filter: {'ON' if c.get('low_volume_filter_enabled', 1.0) >= 0.5 else 'OFF'} | min 24h volume: {c.get('min_24h_volume', 0):,.0f}\n"
         f"• Hút lực từ đỉnh: {'ON' if float(c.get('profit_protect_enabled', 1.0)) >= 0.5 else 'OFF'} | start {c.get('profit_protect_start_roi', 10.0):.1f}% ROI | tụt {c.get('profit_protect_pullback_roi', 8.0):.1f}% ROI thì đóng\n\n"
         "💰 <b>QUẢN LÝ VỐN</b>\n"
         "• Mỗi lệnh, kể cả đảo chiều: tính theo % số dư margin hiện tại.\n"
-        "• Không dùng vốn lệnh trước * hệ số khi đảo chiều nữa.\n\n"
-        "Luồng tín hiệu:\n"
+        "• TP/SL tính theo ROI đã nhân đòn bẩy.\n\n"
+        "Luồng tín hiệu mới:\n"
         "1) Lấy 5 nến đã đóng gần nhất C1..C5 và nến hiện tại C6 theo khung đã chọn.\n"
-        "2) C5 và C6 phải không sideway/doji.\n"
-        "3) Case giảm tốc: C1 là vùng tốc độ cao nhất, C5 là thấp nhất; C6 tăng tốc lại từ C5, nếu giảm mạnh thì C6 phải nhanh hơn cả C4 và C5.\n"
-        "4) Case tăng tốc rồi hụt: C4 là vùng cao nhất, C5 giảm, C6 tăng lại và ngược hướng đa số C1..C5.\n"
-        "5) Case nhấp nhô: mặc định chỉ vào khi C6 nhanh hơn C4+C5 và ngược hướng đa số C1..C5.\n"
-        "6) Tất cả trường hợp đạt đều vào theo hướng nến C6."
+        "2) Tìm nến tốc độ cao nhất PEAK và thấp nhất VALLEY trong C1..C5.\n"
+        "3) C5 và C6 phải không sideway/doji.\n"
+        "4) C6 phải chạy đủ thời gian tối thiểu và tốc độ C6 phải nằm từ vùng trung bình (PEAK+VALLEY)/2 lên tới vùng PEAK.\n"
+        "5) Nếu VALLEY nằm trước PEAK: tốc độ đang tăng → tín hiệu hợp lệ khi C6 đi ngược hướng nến PEAK.\n"
+        "6) Nếu PEAK nằm trước VALLEY: tốc độ đang giảm → tín hiệu hợp lệ khi C6 đi ngược hướng nến VALLEY.\n"
+        "7) Nếu C6 vượt khỏi vùng tốc độ cho phép hoặc không đúng hướng xác nhận thì bỏ qua."
     )
+
 def _candle_direction(open_price, close_price):
     if close_price > open_price:
         return "BUY"
@@ -822,15 +827,14 @@ def _score_signal_parts(open_curr, current_price, high_curr, low_curr, volume_cu
                         prev_candle, market_candle=None, progress=1.0,
                         mode='entry', recent_1m_history=None, market_history=None):
     """
-    Chiến lược SPEED PATTERN 5+1:
-    - C1..C5: 5 nến đã đóng gần nhất theo signal_interval, C5 là nến gần nhất.
+    Chiến lược PEAK/VALLEY SPEED 5+1:
+    - C1..C5: 5 nến đã đóng gần nhất theo signal_interval.
     - C6: nến hiện tại đang chạy, tốc độ = volume hiện tại / progress.
-    - Không dùng EMA/RSI/market regime.
+    - Tìm PEAK = nến tốc độ cao nhất và VALLEY = nến tốc độ thấp nhất trong C1..C5.
+    - Nếu VALLEY trước PEAK => tốc độ tổng thể đang tăng: C6 phải đi ngược hướng PEAK.
+    - Nếu PEAK trước VALLEY => tốc độ tổng thể đang giảm: C6 phải đi ngược hướng VALLEY.
+    - C6 phải nằm trong vùng tốc độ hợp lý: >= trung bình(PEAK, VALLEY) và <= PEAK * upper_factor.
     - C5 và C6 phải không sideway/doji.
-    - Case A: C1 cao nhất, C5 thấp nhất => giảm tốc tổng thể; C6 tăng tốc lại => vào theo C6.
-      Nếu giảm rất mạnh thì C6 phải nhanh hơn cả C4 và C5.
-    - Case B: C4 là vùng cao nhất, C5 bắt đầu giảm, C6 tăng lại và ngược hướng đa số C1..C5 => vào theo C6.
-    - Case C: tốc độ nhấp nhô, chỉ vào nếu C6 nhanh hơn C4+C5 và ngược hướng đa số C1..C5.
     """
     try:
         cfg = _STRATEGY_CONFIG.get_all()
@@ -845,7 +849,6 @@ def _score_signal_parts(open_curr, current_price, high_curr, low_curr, volume_cu
         if len(history) < 5:
             return None, 0, f'missing_closed_history len={len(history)} need=5', False
         closed5 = history[-5:]
-        c1, c2, c3, c4, c5 = closed5
         speeds = [_volume_speed(c) for c in closed5]
         if any(s <= 0 for s in speeds):
             return None, 0, 'bad_closed_speed', False
@@ -858,7 +861,11 @@ def _score_signal_parts(open_curr, current_price, high_curr, low_curr, volume_cu
         if not current_side:
             return None, 0, 'current_flat_no_direction', False
 
-        ok5, body5 = _is_not_sideway_candle(_candle_get(c5, 'open', 1), _candle_get(c5, 'close', 4), _candle_get(c5, 'high', 2), _candle_get(c5, 'low', 3))
+        c5 = closed5[-1]
+        ok5, body5 = _is_not_sideway_candle(
+            _candle_get(c5, 'open', 1), _candle_get(c5, 'close', 4),
+            _candle_get(c5, 'high', 2), _candle_get(c5, 'low', 3)
+        )
         ok6, body6 = _is_not_sideway_candle(open_curr, current_price, high_curr, low_curr)
         if not ok5:
             return None, 0, f'c5_sideway body_ratio={body5:.2f}', False
@@ -866,48 +873,62 @@ def _score_signal_parts(open_curr, current_price, high_curr, low_curr, volume_cu
             return None, 0, f'c6_sideway body_ratio={body6:.2f}', False
 
         tol = float(cfg.get('speed_edge_tolerance', 0.05))
-        current_vs_low = float(cfg.get('current_vs_low_factor', 1.20))
-        strong_decline_factor = float(cfg.get('strong_decline_factor', 2.0))
-        current_vs_recent = float(cfg.get('current_vs_recent_factor', 1.0))
-        majority = _majority_direction(closed5)
-        opposite_majority = _opposite_side(majority) if majority else None
+        mid_factor = float(cfg.get('speed_mid_factor', 1.0))
+        upper_factor = float(cfg.get('speed_peak_upper_factor', 1.0))
 
-        s1, s2, s3, s4, s5 = speeds
-        case = None
-        need_speed = None
+        peak_speed = max(speeds)
+        valley_speed = min(speeds)
+        if peak_speed <= 0 or valley_speed <= 0:
+            return None, 0, 'bad_peak_valley_speed', False
 
-        decreasing_structure = _near_highest(s1, speeds, tol) and _near_lowest(s5, speeds, tol)
-        if decreasing_structure:
-            if s1 / max(s5, 1e-12) >= strong_decline_factor:
-                need_speed = max(s4, s5) * current_vs_recent
-            else:
-                need_speed = s5 * current_vs_low
-            if current_speed > need_speed:
-                case = 'DECREASE_LOW_REBOUND'
+        # Nếu PEAK và VALLEY quá sát nhau thì không có cấu trúc tốc độ rõ ràng.
+        if peak_speed / max(valley_speed, 1e-12) < (1.0 + tol):
+            return None, 0, f'flat_speed_range peak={peak_speed:.4f} valley={valley_speed:.4f}', False
 
-        if case is None and float(cfg.get('peak_pullback_enabled', 1.0)) >= 0.5:
-            peak_pullback = _near_highest(s4, speeds, tol) and s5 < s4 and current_speed > s5 * current_vs_low
-            if peak_pullback and opposite_majority and current_side == opposite_majority:
-                case = 'PEAK_PULLBACK_REVERSE_MAJORITY'
+        peak_idx = speeds.index(peak_speed)      # 0-based, C1 = 0
+        valley_idx = speeds.index(valley_speed)  # 0-based, C1 = 0
+        if peak_idx == valley_idx:
+            return None, 0, 'peak_valley_same_index', False
 
-        if case is None and float(cfg.get('choppy_pattern_enabled', 1.0)) >= 0.5:
-            if current_speed > max(s4, s5) * current_vs_recent and opposite_majority and current_side == opposite_majority:
-                case = 'CHOPPY_REVERSE_MAJORITY_STRONG_C6'
+        mid_speed = (peak_speed + valley_speed) / 2.0
+        min_required = mid_speed * mid_factor
+        max_allowed = peak_speed * upper_factor
+        if current_speed < min_required:
+            return None, 0, f'c6_speed_below_mid c6={current_speed:.4f} min={min_required:.4f}', False
+        if upper_factor > 0 and current_speed > max_allowed:
+            return None, 0, f'c6_speed_over_peak_limit c6={current_speed:.4f} max={max_allowed:.4f}', False
 
-        if case is None:
-            return None, 0, (
-                f'no_speed_pattern speeds={[round(x, 4) for x in speeds]} c6={current_speed:.4f} '
-                f'majority={majority} current={current_side}'
-            ), False
+        peak_side = _history_candle_direction(closed5[peak_idx])
+        valley_side = _history_candle_direction(closed5[valley_idx])
+        if not peak_side or not valley_side:
+            return None, 0, 'peak_or_valley_no_direction', False
+
+        if valley_idx < peak_idx:
+            # Đáy tốc độ trước, đỉnh tốc độ sau: tốc độ đang tăng.
+            # C6 chỉ hợp lệ nếu đi ngược hướng nến PEAK.
+            expected = _opposite_side(peak_side)
+            case = 'VALLEY_BEFORE_PEAK_SPEED_INCREASING_REVERSE_PEAK'
+            ref = f'peak=C{peak_idx+1}:{peak_side}'
+        else:
+            # Đỉnh tốc độ trước, đáy tốc độ sau: tốc độ đang giảm.
+            # C6 tốc độ hồi lên trong vùng hợp lý, đi ngược hướng nến VALLEY.
+            expected = _opposite_side(valley_side)
+            case = 'PEAK_BEFORE_VALLEY_SPEED_DECREASING_REVERSE_VALLEY'
+            ref = f'valley=C{valley_idx+1}:{valley_side}'
+
+        if current_side != expected:
+            return None, 0, f'c6_direction_not_expected case={case} current={current_side} expected={expected} {ref}', False
 
         reason = (
-            f'speed_pattern_ok | case={case} interval={signal_interval} elapsed={elapsed:.1f}s progress={progress:.3f} '
-            f'speeds={[round(x, 4) for x in speeds]} c6_speed={current_speed:.4f} '
-            f'body5={body5:.2f} body6={body6:.2f} majority={majority} final_signal={current_side}'
+            f'peak_valley_speed_ok | case={case} interval={signal_interval} elapsed={elapsed:.1f}s progress={progress:.3f} '
+            f'speeds={[round(x, 4) for x in speeds]} peak=C{peak_idx+1}:{peak_speed:.4f}({peak_side}) '
+            f'valley=C{valley_idx+1}:{valley_speed:.4f}({valley_side}) c6_speed={current_speed:.4f} '
+            f'mid={mid_speed:.4f} range=[{min_required:.4f},{max_allowed:.4f}] body5={body5:.2f} body6={body6:.2f} '
+            f'final_signal={current_side}'
         )
         return current_side, 1, reason, False
     except Exception as e:
-        logger.error(f"Lỗi chấm điểm tín hiệu speed pattern: {e}")
+        logger.error(f"Lỗi chấm điểm tín hiệu peak/valley speed: {e}")
         return None, 0, 'error', False
 
 def _kline_to_candle_dict(arr, symbol, interval, is_final=True):
@@ -1611,6 +1632,9 @@ class BaseBot:
 
             if symbol_info['position_open']:
                 self._check_symbol_tp_sl(symbol)
+                # Nếu TP/SL hoặc hút lực từ đỉnh vừa đóng lệnh thì không kiểm tra đảo chiều nữa.
+                if not symbol_info.get('position_open'):
+                    return False
                 self._check_realtime_exit(symbol)
                 return False
             else:
@@ -2609,9 +2633,9 @@ class BotManager:
             '✏️ Speed edge tolerance': ('speed_edge_tolerance', 'Sai số khi xét C1 cao nhất, C5 thấp nhất/C4 cao nhất. Ví dụ 0.03, 0.05, 0.10'),
             '✏️ Current vs low': ('current_vs_low_factor', 'C6 phải nhanh hơn C5 tối thiểu bao nhiêu lần. Ví dụ 1.1, 1.2, 1.5'),
             '✏️ Strong decline factor': ('strong_decline_factor', 'Nếu C1/C5 >= mức này thì coi là giảm mạnh và yêu cầu C6 > C4+C5. Ví dụ 1.5, 2.0, 3.0'),
-            '✏️ Current vs recent': ('current_vs_recent_factor', 'Trong giảm mạnh/nhấp nhô, C6 phải nhanh hơn C4 và C5 bao nhiêu lần. Ví dụ 1.0, 1.1, 1.2'),
-            '✏️ Choppy pattern': ('choppy_pattern_enabled', '1 = bật case nhấp nhô: C6 nhanh hơn C4+C5 và ngược hướng đa số 5 nến trước; 0 = tắt'),
-            '✏️ Peak pullback': ('peak_pullback_enabled', '1 = bật case tăng tốc quá nhanh rồi C5 hụt, C6 ngược đa số; 0 = tắt'),
+            '✏️ Current vs recent': ('current_vs_recent_factor', 'Tham số cũ, giữ để tương thích. Hiện thuật toán chính dùng Speed mid/peak upper.'),
+            '✏️ Speed mid factor': ('speed_mid_factor', 'C6 phải >= trung bình(PEAK, VALLEY) * hệ số này. Ví dụ 1.0, 1.1'),
+            '✏️ Speed peak upper': ('speed_peak_upper_factor', 'C6 không được vượt PEAK * hệ số này. 1.0 = trong vùng tới PEAK, 1.2 = cho vượt nhẹ.'),
             '✏️ Low volume filter': ('low_volume_filter_enabled', '1 = bật lọc coin volume 24h thấp; 0 = tắt'),
             '✏️ Min 24h volume': ('min_24h_volume', 'Volume 24h tối thiểu của coin để bot động chọn. Ví dụ 10000000, 50000000'),
             '✏️ Profit protect ON/OFF': ('profit_protect_enabled', '1 = bật hút lực từ đỉnh, 0 = tắt.'),
