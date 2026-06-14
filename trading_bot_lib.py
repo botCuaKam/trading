@@ -84,8 +84,6 @@ def setup_logging():
 
 logger = setup_logging()
 
-# Debug tín hiệu: chỉ ghi Railway log, không gửi Telegram để tránh spam.
-_SIGNAL_DEBUG_LAST_SCAN_LOG = {}
 
 _SIGNAL_DATA_CACHE = {}
 _SIGNAL_DATA_CACHE_TTL = 1.0
@@ -292,9 +290,6 @@ def create_strategy_config_keyboard():
             [{"text": "✏️ Cắt lỗ khẩn cấp"}],
             [{"text": "✏️ Lọc coin volume thấp"}, {"text": "✏️ Volume 24h tối thiểu"}],
             [{"text": "✏️ Số coin quét tối đa"}],
-            [{"text": "🧪 Debug tín hiệu"}],
-            [{"text": "✏️ Bật debug tín hiệu"}, {"text": "✏️ Chu kỳ debug tín hiệu"}],
-            [{"text": "✏️ Số coin debug mỗi lượt"}, {"text": "✏️ Ưu tiên REST khi quét"}],
             [{"text": "✏️ Bảo vệ lợi nhuận"}, {"text": "✏️ ROI bắt đầu bảo vệ"}],
             [{"text": "✏️ ROI tụt từ đỉnh để đóng"}],
             [{"text": "♻️ Reset tham số chiến lược"}],
@@ -716,9 +711,9 @@ class StrategyConfig:
     - Vào lệnh cần điểm cao, thoát lệnh cần điểm thấp hơn, đảo chiều cần điểm rất cao.
     """
     DEFAULTS = {
-        'current_interval': '1m',
-        'signal_interval': '1m',
-        'timeframe_seconds': 60.0,
+        'current_interval': '15m',
+        'signal_interval': '15m',
+        'timeframe_seconds': 900.0,
 
         # Điểm tín hiệu
         'entry_score_threshold': 75.0,
@@ -727,17 +722,17 @@ class StrategyConfig:
         'min_score_gap': 8.0,
 
         # Điều kiện cơ bản khi VÀO lệnh - chỉ dùng nến hiện tại
-        'entry_min_body_pct': 0.06,
-        'entry_min_range_pct': 0.08,
-        'entry_min_body_ratio': 0.25,
+        'entry_min_body_pct': 1.000,
+        'entry_min_range_pct': 0.250,
+        'entry_min_body_ratio': 0.60,
         'entry_min_quote_volume': 5000.0,
         'entry_min_trades': 10,
 
         # Điều kiện cơ bản khi THOÁT lệnh - nhẹ hơn vào lệnh
-        'exit_min_body_pct': 0.03,
-        'exit_min_range_pct': 0.04,
-        'exit_min_body_ratio': 0.15,
-        'exit_min_quote_volume': 1500.0,
+        'exit_min_body_pct': 0.250,
+        'exit_min_range_pct': 0.250,
+        'exit_min_body_ratio': 0.25,
+        'exit_min_quote_volume': 5000.0,
         'exit_min_trades': 3,
         'exit_taker_ratio_min': 0.52,
 
@@ -757,8 +752,8 @@ class StrategyConfig:
 
         # TP/SL và bảo vệ vị thế
         'emergency_stop_roi': 0.0,
-        'strategy_tp_roi': 100.0,
-        'strategy_sl_roi': 40.0,
+        'strategy_tp_roi': 1000.0,
+        'strategy_sl_roi': 0.0,
 
         # Tắt guard cũ dựa vào nến đóng trước để chiến lược chính chỉ dùng nến hiện tại.
         'exit_loss_guard_enabled': 0.0,
@@ -769,20 +764,15 @@ class StrategyConfig:
 
         # Lọc coin / bảo vệ lợi nhuận
         'low_volume_filter_enabled': 1.0,
-        'min_24h_volume': 10000000.0,
+        'min_24h_volume': 100000000.0,
         'profit_protect_enabled': 1.0,
-        'profit_protect_start_roi': 10.0,
-        'profit_protect_pullback_roi': 8.0,
+        'profit_protect_start_roi': 50.0,
+        'profit_protect_pullback_roi': 30.0,
         'max_reverse_count': 10,
-        'scan_top_coin_limit': 120,
+        'scan_top_coin_limit': 50,
 
-        # Debug tín hiệu đầy đủ trên Railway log
-        # 1 = ghi chi tiết lý do coin không vào lệnh; 0 = tắt.
-        'signal_debug_enabled': 1.0,
-        'signal_debug_interval': 20.0,
-        'signal_debug_log_limit': 20,
-        # 1 = khi tìm coin luôn gọi REST kline để lấy đủ q/Q/n, tránh websocket thiếu dữ liệu.
-        'force_rest_signal_enabled': 1.0,
+        # REST chỉ dùng khi WebSocket thiếu/stale để giảm request Railway.
+        'force_rest_signal_enabled': 0.0,
 
         # Giữ một số key cũ để tránh lỗi nếu trạng thái Telegram cũ còn gọi
         'min_elapsed_seconds': 0.0,
@@ -791,7 +781,7 @@ class StrategyConfig:
         'extreme_interval': '1m',
         'confirm_min_body_pct': 0.03,
     }
-    INT_KEYS = {'max_reverse_count', 'entry_min_trades', 'exit_min_trades', 'scan_top_coin_limit', 'signal_debug_log_limit'}
+    INT_KEYS = {'max_reverse_count', 'entry_min_trades', 'exit_min_trades', 'scan_top_coin_limit'}
     STRING_KEYS = {'current_interval', 'signal_interval', 'compare_interval', 'market_interval', 'extreme_interval'}
 
     def __init__(self):
@@ -890,9 +880,7 @@ def get_strategy_config_text():
         f"• Cắt lỗ khẩn cấp: {float(c.get('emergency_stop_roi', 0.0)):.1f}% ROI (0 = tắt)\n"
         f"• Bảo vệ lợi nhuận: {'BẬT' if float(c.get('profit_protect_enabled', 1.0)) >= 0.5 else 'TẮT'} | bắt đầu {float(c.get('profit_protect_start_roi', 10.0)):.1f}% | tụt {float(c.get('profit_protect_pullback_roi', 8.0)):.1f}% thì đóng\n"
         f"• Lọc coin volume thấp: {'BẬT' if float(c.get('low_volume_filter_enabled', 1.0)) >= 0.5 else 'TẮT'} | volume 24h tối thiểu: {float(c.get('min_24h_volume', 0)):,.0f}\n"
-        f"• Số coin quét tối đa mỗi lượt: {int(c.get('scan_top_coin_limit', 120) or 120)}\n"
-        f"• Debug tín hiệu Railway: {'BẬT' if float(c.get('signal_debug_enabled', 1.0)) >= 0.5 else 'TẮT'} | mỗi {float(c.get('signal_debug_interval', 20.0)):.0f}s | tối đa {int(c.get('signal_debug_log_limit', 20) or 20)} coin/lượt\n"
-        f"• Ưu tiên REST khi quét coin: {'BẬT' if float(c.get('force_rest_signal_enabled', 1.0)) >= 0.5 else 'TẮT'}\n"
+        f"• Số coin quét tối đa mỗi lượt: {int(c.get('scan_top_coin_limit', 50) or 50)}\n"
         "• Đồng bộ vị thế thật Binance: BẬT, kiểm tra thường xuyên trước TP/SL/đảo chiều.\n"
     )
 
@@ -1250,7 +1238,7 @@ def get_candle_signal_1h(symbol):
         return None
 
 def get_candle_signal_details(symbol):
-    """Lấy đầy đủ dữ liệu tín hiệu bằng REST current kline, gồm q/Q/n để debug taker buy/sell."""
+    """Lấy dữ liệu tín hiệu bằng REST current kline, gồm q/Q/n để chấm lực mua/bán."""
     try:
         curr, prev1, market, history = _fetch_rest_1m15m_signal_data(symbol)
         if not curr or not prev1:
@@ -1540,30 +1528,6 @@ class SmartCoinFinder:
 
                 details = get_candle_signal_details(symbol)
                 signal = details.get('signal') if details else None
-
-                # Ghi debug đầy đủ vào Railway log để biết taker q/Q/n có lấy được không.
-                if float(_STRATEGY_CONFIG.get('signal_debug_enabled', 1.0) or 0.0) >= 0.5:
-                    try:
-                        dbg_interval = float(_STRATEGY_CONFIG.get('signal_debug_interval', 20.0) or 20.0)
-                        dbg_limit = int(float(_STRATEGY_CONFIG.get('signal_debug_log_limit', 20) or 20))
-                        scan_id = int(now // max(dbg_interval, 1.0))
-                        key_dbg = ('scan', scan_id)
-                        used = _SIGNAL_DEBUG_LAST_SCAN_LOG.get(key_dbg, 0)
-                        if used < dbg_limit:
-                            _SIGNAL_DEBUG_LAST_SCAN_LOG[key_dbg] = used + 1
-                            # Xóa key cũ để dict không phình RAM.
-                            for old_key in list(_SIGNAL_DEBUG_LAST_SCAN_LOG.keys()):
-                                if isinstance(old_key, tuple) and old_key[0] == 'scan' and old_key[1] < scan_id - 3:
-                                    _SIGNAL_DEBUG_LAST_SCAN_LOG.pop(old_key, None)
-                            logger.info(
-                                f"🔬 DEBUG_SIGNAL_SCAN {symbol} | signal={signal} score={float(details.get('score', 0) or 0):.1f} "
-                                f"source={details.get('source')} q={float(details.get('quote_volume', 0) or 0):.0f} "
-                                f"takerBuyQ={float(details.get('taker_buy_quote', 0) or 0):.0f} "
-                                f"takerSellQ={float(details.get('taker_sell_quote', 0) or 0):.0f} "
-                                f"trades={int(details.get('num_trades', 0) or 0)} | {details.get('reason')}"
-                            )
-                    except Exception as dbg_e:
-                        logger.error(f"Lỗi ghi debug tín hiệu scan {symbol}: {dbg_e}")
 
                 if signal is None:
                     continue
@@ -1908,7 +1872,6 @@ class BaseBot:
         self.realtime_signal = {}        # symbol -> 'BUY'/'SELL'/None
         self.last_signal_time = {}       # symbol -> timestamp
         self.signal_cache_ttl = 2        # giây
-        self.last_signal_debug_time = {}  # symbol -> timestamp, chống spam log debug tín hiệu
         self.exit_candidate = {}          # symbol -> {'side': ..., 'since': ...}
 
         # Thống kê lời/lỗ đã đóng trong phiên bot hiện tại.
@@ -2200,24 +2163,6 @@ class BaseBot:
             details['taker_sell_quote'] = max(0.0, _quote_volume_of(candle) - _taker_buy_quote_of(candle))
             details['num_trades'] = _num_trades_of(candle)
 
-            # Log chi tiết realtime cho coin đang theo dõi, chỉ ghi Railway log, không gửi Telegram.
-            if float(_STRATEGY_CONFIG.get('signal_debug_enabled', 1.0) or 0.0) >= 0.5:
-                try:
-                    dbg_interval = float(_STRATEGY_CONFIG.get('signal_debug_interval', 20.0) or 20.0)
-                    dbg_key = (symbol, mode)
-                    now_dbg = time.time()
-                    if now_dbg - self.last_signal_debug_time.get(dbg_key, 0) >= max(dbg_interval, 1.0):
-                        self.last_signal_debug_time[dbg_key] = now_dbg
-                        logger.info(
-                            f"🔬 DEBUG_SIGNAL_LIVE {symbol} mode={mode} | signal={signal} score={float(details.get('score', 0) or 0):.1f} "
-                            f"source={data_source} q={float(details.get('quote_volume', 0) or 0):.0f} "
-                            f"takerBuyQ={float(details.get('taker_buy_quote', 0) or 0):.0f} "
-                            f"takerSellQ={float(details.get('taker_sell_quote', 0) or 0):.0f} "
-                            f"trades={int(details.get('num_trades', 0) or 0)} | {details.get('reason')}"
-                        )
-                except Exception as dbg_e:
-                    logger.error(f"Lỗi ghi debug live {symbol}: {dbg_e}")
-
             self.realtime_signal[symbol] = signal
             self.last_signal_time[symbol] = time.time()
             if symbol in self.symbol_data:
@@ -2253,31 +2198,6 @@ class BaseBot:
         except Exception as e:
             logger.error(f"Lỗi REST fallback lấy nến Real Force Candle {symbol}: {e}")
             return None, None, None, []
-
-    def _debug_realtime_signal(self, symbol, current_side=None):
-        """Log nhanh lý do chưa có tín hiệu để kiểm tra Real Force Candle."""
-        try:
-            now = time.time()
-            if now - self.last_signal_debug_time.get(symbol, 0) < 5:
-                return
-            self.last_signal_debug_time[symbol] = now
-
-            candle = self.kline_manager.get_candle(symbol) if self.kline_manager else None
-            prev = self.kline_manager.get_prev_candle(symbol) if self.kline_manager else None
-            if not candle or not prev:
-                self.log(f"🔎 {symbol} chưa đủ dữ liệu kline để xét đảo chiều | candle={bool(candle)} prev={bool(prev)} side={current_side}")
-                return
-
-            open_curr = float(candle['open'])
-            price = float(self.symbol_data.get(symbol, {}).get('last_price', 0) or candle.get('close', 0) or 0)
-            body_curr = abs(price - open_curr)
-            body_prev = abs(float(prev['close']) - float(prev['open']))
-            vol_curr = float(candle['volume'])
-            vol_prev = float(prev['volume'])
-            direction = 'BUY' if price > open_curr else 'SELL' if price < open_curr else 'FLAT'
-        except Exception as e:
-            logger.error(f"Lỗi debug signal {symbol}: {e}")
-
     def _check_realtime_exit(self, symbol):
         """
         Đóng/đảo chiều ngay khi xuất hiện tín hiệu ngược đủ chuẩn.
@@ -2297,10 +2217,9 @@ class BaseBot:
         details = self._get_fresh_realtime_signal(symbol, mode='exit', return_details=True)
         signal = details.get('signal')
 
-        # Không spam log debug; chỉ log khi thật sự đóng/đảo.
 
         if signal is None or signal == current_side:
-            # Không đóng nếu chưa có tín hiệu ngược, nhưng lưu lý do để phần thống kê/debug nhìn được bot đang bị cản bởi gì.
+            # Không đóng nếu chưa có tín hiệu ngược; lưu lý do ngắn để thống kê nội bộ.
             if symbol in self.symbol_data:
                 self.symbol_data[symbol]['last_exit_check_reason'] = details.get('reason')
             return
@@ -2867,7 +2786,6 @@ class BaseBot:
         self.coin_manager.unregister_coin(symbol)
         self.realtime_signal.pop(symbol, None)
         self.last_signal_time.pop(symbol, None)
-        self.last_signal_debug_time.pop(symbol, None)
         self.exit_candidate.pop(symbol, None)
         self.symbol_data.pop(symbol, None)
         invalidate_position_cache(symbol, self.api_key)
@@ -2942,7 +2860,7 @@ class BotManager:
 
         if api_key and api_secret:
             self._verify_api_connection()
-            self.log("🟢 HỆ THỐNG BOT REAL FORCE CANDLE - DEBUG TAKER FIX")
+            self.log("🟢 HỆ THỐNG BOT REAL FORCE CANDLE - CLEAN")
             self._initialize_cache()
             self._cache_thread = threading.Thread(target=self._cache_updater, daemon=True, name='cache_updater')
             self._cache_thread.start()
@@ -3360,10 +3278,6 @@ class BotManager:
             '✏️ Lọc coin volume thấp': ('low_volume_filter_enabled', '1 = bật lọc coin volume 24h thấp, 0 = tắt.'),
             '✏️ Volume 24h tối thiểu': ('min_24h_volume', 'Volume 24h tối thiểu để bot chọn coin.'),
             '✏️ Số coin quét tối đa': ('scan_top_coin_limit', 'Giới hạn số coin volume cao nhất được quét mỗi lượt để giảm RAM/API. Ví dụ 80, 120, 200.'),
-            '✏️ Bật debug tín hiệu': ('signal_debug_enabled', '1 = bật log chi tiết tín hiệu ra Railway, 0 = tắt.'),
-            '✏️ Chu kỳ debug tín hiệu': ('signal_debug_interval', 'Mỗi bao nhiêu giây mới ghi lại log debug cho cùng một coin/mode. Ví dụ 10, 20, 30.'),
-            '✏️ Số coin debug mỗi lượt': ('signal_debug_log_limit', 'Mỗi chu kỳ scan ghi tối đa bao nhiêu coin không có tín hiệu để tránh spam log. Ví dụ 10, 20, 50.'),
-            '✏️ Ưu tiên REST khi quét': ('force_rest_signal_enabled', '1 = luôn dùng REST current kline để lấy đủ q/Q/n khi quét và kiểm tra tín hiệu, 0 = ưu tiên websocket.'),
             '✏️ Bảo vệ lợi nhuận': ('profit_protect_enabled', '1 = bật bảo vệ lợi nhuận, 0 = tắt.'),
             '✏️ ROI bắt đầu bảo vệ': ('profit_protect_start_roi', 'ROI từng đạt từ mức này trở lên thì bắt đầu bảo vệ lợi nhuận.'),
             '✏️ ROI tụt từ đỉnh để đóng': ('profit_protect_pullback_roi', 'Khi ROI tụt từ đỉnh xuống mức này thì đóng.'),
@@ -3485,7 +3399,7 @@ class BotManager:
                     _STRATEGY_CONFIG.update(**{key: val})
                 else:
                     val = float(text)
-                    int_keys = {'max_reverse_count', 'entry_min_trades', 'exit_min_trades', 'scan_top_coin_limit', 'signal_debug_log_limit'}
+                    int_keys = {'max_reverse_count', 'entry_min_trades', 'exit_min_trades', 'scan_top_coin_limit'}
                     if key in int_keys:
                         val = int(val)
                         if val < 0 or val > 10000:
